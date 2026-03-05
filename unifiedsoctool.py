@@ -31,6 +31,22 @@ try:
 except ImportError as e:
     print(f"Missing Library: {e}")
     print("Please install: pip install openai pypdf azure-identity azure-monitor-query pandas colorama tiktoken python-docx")
+    print("Optional AI providers: pip install anthropic google-generativeai")
+
+# Optional AI Provider imports
+HAS_ANTHROPIC = False
+try:
+    import anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    pass
+
+HAS_GEMINI = False
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    pass
 
 # ==========================================
 # 1. SHARED CONFIGURATION & UTILS
@@ -38,6 +54,23 @@ except ImportError as e:
 
 MODEL_OPTIONS = ["gpt-4o", "gpt-4o-mini", "gpt-5.2", "gpt-5-mini"]
 DEFAULT_MODEL = "gpt-4o"
+
+PROVIDER_OPTIONS = ["OpenAI", "Gemini", "Claude"]
+PROVIDER_MODELS = {
+    "OpenAI": ["gpt-4o", "gpt-4o-mini", "gpt-5.2", "gpt-5-mini"],
+    "Gemini": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-3.1-pro", "gemini-3.1-flash"],
+    "Claude": ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
+}
+PROVIDER_DEFAULTS = {
+    "OpenAI": "gpt-4o",
+    "Gemini": "gemini-2.5-pro",
+    "Claude": "claude-sonnet-4-6",
+}
+PROVIDER_ENV_KEYS = {
+    "OpenAI": "OPENAI_API_KEY",
+    "Gemini": "GEMINI_API_KEY",
+    "Claude": "ANTHROPIC_API_KEY",
+}
 
 class SessionLogger:
     """Redirects print statements to a tkinter ScrolledText widget."""
@@ -129,38 +162,39 @@ You can query ANY table in the Azure Log Analytics workspace. Use whatever table
 If the user mentions a specific table name, use it directly.
 If the user describes what they want but doesn't name a table, pick the best table from the common ones below or use `search`.
 
-Common tables and their typical columns (not exhaustive - tables may have additional columns):
-- DeviceProcessEvents (TimeGenerated, AccountName, ActionType, DeviceName, InitiatingProcessCommandLine, ProcessCommandLine, FileName, FolderPath)
-- DeviceNetworkEvents (TimeGenerated, ActionType, DeviceName, RemoteIP, RemotePort, RemoteUrl, LocalIP)
-- DeviceLogonEvents (TimeGenerated, AccountName, DeviceName, ActionType, RemoteIP, RemoteDeviceName, LogonType)
-- DeviceFileEvents (TimeGenerated, DeviceName, FileName, FolderPath, ActionType, SHA256, InitiatingProcessFileName)
-- DeviceRegistryEvents (TimeGenerated, DeviceName, ActionType, RegistryKey, RegistryValueName, RegistryValueData)
-- DeviceImageLoadEvents (TimeGenerated, DeviceName, FileName, FolderPath, SHA256, InitiatingProcessFileName)
-- DeviceEvents (TimeGenerated, DeviceName, ActionType, AdditionalFields)
-- EmailEvents (TimeGenerated, SenderFromAddress, RecipientEmailAddress, Subject, DeliveryAction, ThreatTypes)
-- EmailAttachmentInfo (TimeGenerated, FileName, FileType, SHA256, SenderFromAddress, RecipientEmailAddress)
-- EmailUrlInfo (TimeGenerated, Url, UrlDomain, NetworkMessageId)
-- IdentityLogonEvents (TimeGenerated, AccountUpn, ActionType, LogonType, Application, IPAddress)
-- IdentityQueryEvents (TimeGenerated, AccountUpn, ActionType, QueryType, QueryTarget)
-- IdentityDirectoryEvents (TimeGenerated, AccountUpn, ActionType, TargetAccountUpn, Application)
-- CloudAppEvents (TimeGenerated, AccountId, ActionType, Application, IPAddress, UserAgent)
-- AlertEvidence (TimeGenerated, EntityType, EvidenceRole, RemoteIP, FileName, AccountName)
-- SigninLogs (TimeGenerated, UserPrincipalName, IPAddress, AppDisplayName, ResultType, ResultDescription, Location, ConditionalAccessStatus)
-- AADNonInteractiveUserSignInLogs (TimeGenerated, UserPrincipalName, IPAddress, AppDisplayName, ResultType)
-- AuditLogs (TimeGenerated, OperationName, Result, InitiatedBy, TargetResources, Category)
-- AzureActivity (TimeGenerated, Caller, OperationNameValue, ActivityStatusValue, ResourceGroup, SubscriptionId)
-- SecurityAlert (TimeGenerated, AlertName, AlertSeverity, Description, CompromisedEntity, Tactics, Techniques, ProviderName)
-- SecurityIncident (TimeGenerated, Title, Severity, Status, Owner, IncidentNumber)
-- SecurityEvent (TimeGenerated, EventID, Account, Computer, Activity, IpAddress)
-- Syslog (TimeGenerated, Computer, Facility, SeverityLevel, SyslogMessage, ProcessName)
-- CommonSecurityLog (TimeGenerated, DeviceVendor, DeviceProduct, Activity, SourceIP, DestinationIP, DestinationPort)
-- Event (TimeGenerated, EventID, Computer, Source, RenderedDescription, UserName)
-- Heartbeat (TimeGenerated, Computer, OSType, Version, ComputerIP)
-- ThreatIntelligenceIndicator (TimeGenerated, ThreatType, IndicatorId, DomainName, Url, NetworkIP)
-- BehaviorAnalytics (TimeGenerated, UserPrincipalName, ActionType, ActivityInsights, InvestigationPriority)
-- Anomalies (TimeGenerated, AnomalyName, Description, Score, Tactics, Techniques)
-- W3CIISLog (TimeGenerated, sSiteName, sIP, csMethod, csUriStem, scStatus, cIP)
-- AzureDiagnostics (TimeGenerated, ResourceType, OperationName, ResultType, Category)
+Common tables, what they contain, when to use them, and their typical columns (not exhaustive - tables may have additional columns):
+
+- DeviceProcessEvents: Process creation and execution events on endpoints. Use for investigating suspicious commands, script execution, malware processes, LOLBins, and process trees. Columns: TimeGenerated, AccountName, ActionType, DeviceName, InitiatingProcessCommandLine, ProcessCommandLine, FileName, FolderPath
+- DeviceNetworkEvents: Outbound/inbound network connections from devices. Use for C2 beaconing, data exfiltration, lateral movement, and suspicious remote connections. Columns: TimeGenerated, ActionType, DeviceName, RemoteIP, RemotePort, RemoteUrl, LocalIP
+- DeviceLogonEvents: Authentication events on devices. Use for brute force detection, pass-the-hash, RDP sessions, and unusual logon patterns. Columns: TimeGenerated, AccountName, DeviceName, ActionType, RemoteIP, RemoteDeviceName, LogonType
+- DeviceFileEvents: File creation, modification, and deletion on endpoints. Use for malware drops, file staging, ransomware activity, and suspicious file operations. Columns: TimeGenerated, DeviceName, FileName, FolderPath, ActionType, SHA256, InitiatingProcessFileName
+- DeviceRegistryEvents: Windows registry changes on endpoints. Use for persistence mechanisms, autorun keys, config tampering, and malware registry modifications. Columns: TimeGenerated, DeviceName, ActionType, RegistryKey, RegistryValueName, RegistryValueData
+- DeviceImageLoadEvents: DLL and driver load events on endpoints. Use for DLL sideloading, DLL injection, unsigned module loading, and suspicious driver loads. Columns: TimeGenerated, DeviceName, FileName, FolderPath, SHA256, InitiatingProcessFileName
+- DeviceEvents: Miscellaneous device events including USB, AMSI, exploit guard, and PowerShell logging. Use for USB device connections, exploit mitigation triggers, and advanced threat events. Columns: TimeGenerated, DeviceName, ActionType, AdditionalFields
+- EmailEvents: Email delivery and filtering events. Use for phishing investigations, spam analysis, malicious email delivery or blocking, and email-based attack chains. Columns: TimeGenerated, SenderFromAddress, RecipientEmailAddress, Subject, DeliveryAction, ThreatTypes
+- EmailAttachmentInfo: Email attachment metadata. Use for investigating malicious attachments, suspicious file types in emails, and attachment-based threats. Columns: TimeGenerated, FileName, FileType, SHA256, SenderFromAddress, RecipientEmailAddress
+- EmailUrlInfo: URLs found in email messages. Use for phishing link analysis, malicious URL detection, and URL-based email threats. Columns: TimeGenerated, Url, UrlDomain, NetworkMessageId
+- IdentityLogonEvents: Identity-level sign-in events (Active Directory and cloud). Use for failed logon analysis, unusual authentication patterns, and identity-based attacks. Columns: TimeGenerated, AccountUpn, ActionType, LogonType, Application, IPAddress
+- IdentityQueryEvents: LDAP and directory query events. Use for reconnaissance detection, enumeration of users/groups/computers, and suspicious directory queries. Columns: TimeGenerated, AccountUpn, ActionType, QueryType, QueryTarget
+- IdentityDirectoryEvents: Active Directory changes. Use for account modifications, group membership changes, password resets, and privilege escalation via directory changes. Columns: TimeGenerated, AccountUpn, ActionType, TargetAccountUpn, Application
+- CloudAppEvents: Cloud application activity (SaaS apps). Use for suspicious cloud actions, shadow IT detection, OAuth app abuse, and cloud-based data access. Columns: TimeGenerated, AccountId, ActionType, Application, IPAddress, UserAgent
+- AlertEvidence: Evidence entities linked to security alerts. Use for correlating IPs, files, users, and accounts associated with triggered alerts. Columns: TimeGenerated, EntityType, EvidenceRole, RemoteIP, FileName, AccountName
+- SigninLogs: Azure AD interactive sign-in events. Use for MFA failures, impossible travel detection, conditional access evaluation, and user sign-in anomalies. Columns: TimeGenerated, UserPrincipalName, IPAddress, AppDisplayName, ResultType, ResultDescription, Location, ConditionalAccessStatus
+- AADNonInteractiveUserSignInLogs: Service and app token sign-in events. Use for compromised service principals, token abuse, background app authentication, and non-interactive access patterns. Columns: TimeGenerated, UserPrincipalName, IPAddress, AppDisplayName, ResultType
+- AuditLogs: Azure AD configuration and administrative changes. Use for role assignments, app registrations, policy changes, consent grants, and directory configuration modifications. Columns: TimeGenerated, OperationName, Result, InitiatedBy, TargetResources, Category
+- AzureActivity: Azure resource management operations. Use for unauthorized resource changes, privilege escalation via Azure RBAC, resource creation/deletion, and subscription-level activity. Columns: TimeGenerated, Caller, OperationNameValue, ActivityStatusValue, ResourceGroup, SubscriptionId
+- SecurityAlert: Security alerts from Microsoft Defender and Sentinel analytics rules. Use for alert triage, attack detection, MITRE ATT&CK mapping, and initial incident investigation. Columns: TimeGenerated, AlertName, AlertSeverity, Description, CompromisedEntity, Tactics, Techniques, ProviderName
+- SecurityIncident: Aggregated security incidents from Sentinel. Use for incident management, viewing linked alerts, tracking incident status, and high-level investigation overview. Columns: TimeGenerated, Title, Severity, Status, Owner, IncidentNumber
+- SecurityEvent: Windows Security Event Log (legacy agent). Use for classic event ID analysis (4624/4625 logons, 4688 process creation, 4672 special privileges), Windows security auditing. Columns: TimeGenerated, EventID, Account, Computer, Activity, IpAddress
+- Syslog: Linux and network device syslog messages. Use for Linux authentication logs, service crashes, firewall logs, and network device monitoring. Columns: TimeGenerated, Computer, Facility, SeverityLevel, SyslogMessage, ProcessName
+- CommonSecurityLog: CEF-format logs from security appliances. Use for firewall logs, IDS/IPS alerts, proxy logs, and third-party security device events. Columns: TimeGenerated, DeviceVendor, DeviceProduct, Activity, SourceIP, DestinationIP, DestinationPort
+- Event: Windows Event Log (non-security, legacy agent). Use for application errors, system events, and non-security Windows logs. Columns: TimeGenerated, EventID, Computer, Source, RenderedDescription, UserName
+- Heartbeat: Agent health and connectivity status. Use for confirming which machines are reporting, agent uptime, and connectivity monitoring. Columns: TimeGenerated, Computer, OSType, Version, ComputerIP
+- ThreatIntelligenceIndicator: Threat intelligence IOCs ingested into Sentinel. Use for matching known malicious IPs, domains, file hashes, and URLs against your environment. Columns: TimeGenerated, ThreatType, IndicatorId, DomainName, Url, NetworkIP
+- BehaviorAnalytics: UEBA (User and Entity Behavior Analytics) anomalies. Use for detecting unusual user behavior, insider threats, and anomalous access patterns. Columns: TimeGenerated, UserPrincipalName, ActionType, ActivityInsights, InvestigationPriority
+- Anomalies: ML-detected anomalies from Sentinel analytics. Use for identifying anomalous patterns with MITRE ATT&CK tactics and techniques mapping. Columns: TimeGenerated, AnomalyName, Description, Score, Tactics, Techniques
+- W3CIISLog: IIS web server access logs. Use for web application attacks, suspicious HTTP requests, directory traversal, SQL injection attempts, and web scanning detection. Columns: TimeGenerated, sSiteName, sIP, csMethod, csUriStem, scStatus, cIP
+- AzureDiagnostics: Azure resource diagnostic logs. Use for resource-level operations, errors, and detailed diagnostics from Azure services (Key Vault, SQL, App Gateway, etc.). Columns: TimeGenerated, ResourceType, OperationName, ResultType, Category
 
 If the user asks for a table not listed above, use it anyway - any valid table name in the workspace will work.
 You can also use `search in (Table1, Table2) "keyword"` to search across specific tables.
@@ -261,6 +295,94 @@ Your task:
 6. If data is missing for a template section, note it as "Not enough data available".
 """
 
+def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_tokens=4096, temperature=None):
+    """Unified AI completion wrapper supporting OpenAI, Gemini, and Claude.
+
+    Args:
+        provider: "OpenAI", "Gemini", or "Claude"
+        api_key: API key string for the chosen provider
+        model: Model name string
+        messages: List of {"role": ..., "content": ...} dicts (OpenAI format)
+        json_mode: If True, request JSON output
+        max_tokens: Maximum tokens in response
+        temperature: Optional temperature override
+
+    Returns:
+        Response content as a string
+    """
+    if provider == "OpenAI":
+        client = OpenAI(api_key=api_key)
+        kwargs = {"model": model, "messages": messages}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        response = client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content
+
+    elif provider == "Claude":
+        if not HAS_ANTHROPIC:
+            raise ImportError("anthropic package not installed. Run: pip install anthropic")
+        client = anthropic.Anthropic(api_key=api_key)
+        # Extract system message from messages list
+        system_text = ""
+        user_messages = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_text += msg["content"] + "\n"
+            else:
+                user_messages.append(msg)
+        if json_mode:
+            system_text += "\nYou MUST return valid JSON only. No extra text outside the JSON object."
+        if not user_messages:
+            user_messages = [{"role": "user", "content": "Please proceed."}]
+        kwargs = {
+            "model": model,
+            "max_tokens": max_tokens or 4096,
+            "messages": user_messages,
+        }
+        if system_text.strip():
+            kwargs["system"] = system_text.strip()
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        response = client.messages.create(**kwargs)
+        return response.content[0].text
+
+    elif provider == "Gemini":
+        if not HAS_GEMINI:
+            raise ImportError("google-generativeai package not installed. Run: pip install google-generativeai")
+        genai.configure(api_key=api_key)
+        gen_config = {}
+        if json_mode:
+            gen_config["response_mime_type"] = "application/json"
+        if temperature is not None:
+            gen_config["temperature"] = temperature
+        if max_tokens:
+            gen_config["max_output_tokens"] = max_tokens
+        # Convert messages to Gemini format
+        system_text = ""
+        contents = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_text += msg["content"] + "\n"
+            elif msg["role"] == "assistant":
+                contents.append({"role": "model", "parts": [msg["content"]]})
+            else:
+                contents.append({"role": "user", "parts": [msg["content"]]})
+        # Prepend system text to the first user message if present
+        if system_text.strip() and contents:
+            first_content = contents[0]["parts"][0]
+            contents[0]["parts"][0] = system_text.strip() + "\n\n" + first_content
+        model_obj = genai.GenerativeModel(model, generation_config=gen_config if gen_config else None)
+        response = model_obj.generate_content(contents)
+        return response.text
+
+    else:
+        raise ValueError(f"Unsupported AI provider: {provider}")
+
+
 def sanitize_kql(kql):
     """Clean up AI-generated KQL to fix common problems."""
     if not kql:
@@ -288,7 +410,7 @@ def clean_json_string(json_str):
         return json_str[start : end + 1]
     return json_str.replace("```json", "").replace("```", "").strip()
 
-def get_query_context(openai_client, user_input, model, history=None, hints=None, active_focus="General/All", incident_context=""):
+def get_query_context(provider, api_key, user_input, model, history=None, hints=None, active_focus="General/All", incident_context=""):
     # Keep context concise to avoid confusing the KQL generator
     hist_str = ""
     if history:
@@ -319,10 +441,8 @@ def get_query_context(openai_client, user_input, model, history=None, hints=None
         {"role": "user", "content": user_msg}
     ]
     try:
-        response = openai_client.chat.completions.create(
-            model=model, messages=messages, response_format={"type": "json_object"}
-        )
-        content = clean_json_string(response.choices[0].message.content)
+        content = ai_chat_completion(provider, api_key, model, messages, json_mode=True)
+        content = clean_json_string(content)
         query_context = json.loads(content)
 
         # UPDATED: Clean parameters like EXECUTOR.py
@@ -378,7 +498,7 @@ def execute_kql(law_client, workspace_id, kql, hours=8760):
     except Exception as e:
         raise e
 
-def hunt_on_records(openai_client, records, table_name, model, hints=None, found_flags=None, active_focus="General/All"):
+def hunt_on_records(provider, api_key, records, table_name, model, hints=None, found_flags=None, active_focus="General/All"):
     try:
         df = pd.DataFrame(records)
         csv_data = df.to_csv(index=False)
@@ -401,12 +521,9 @@ LOG DATA:
 {csv_data}"""
 
     try:
-        response = openai_client.chat.completions.create(
-            model=model,
-            messages=[SYSTEM_PROMPT_THREAT_HUNT, {"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
-        )
-        content = clean_json_string(response.choices[0].message.content)
+        messages = [SYSTEM_PROMPT_THREAT_HUNT, {"role": "user", "content": prompt}]
+        content = ai_chat_completion(provider, api_key, model, messages, json_mode=True)
+        content = clean_json_string(content)
         return json.loads(content).get("findings", [])
     except Exception as e:
         raise e
@@ -693,8 +810,16 @@ class UnifiedSOCTool:
         self.root.title("Unified SOC Analyst & Threat Hunter (CTF Edition)")
         self.root.geometry("1400x900")
 
-        self.api_key_var = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
+        self.provider_var = tk.StringVar(value="OpenAI")
+        self.api_key_vars = {
+            "OpenAI": tk.StringVar(value=os.environ.get("OPENAI_API_KEY", "")),
+            "Gemini": tk.StringVar(value=os.environ.get("GEMINI_API_KEY", "")),
+            "Claude": tk.StringVar(value=os.environ.get("ANTHROPIC_API_KEY", "")),
+        }
+        # Backwards-compatible alias — returns the active provider's key
+        self.api_key_var = self.api_key_vars["OpenAI"]
         self.workspace_id_var = tk.StringVar(value="")
+        self._model_combos = []  # List of (model_var, combo_widget) for provider switching
 
         self.active_flag_var = tk.StringVar(value="General/All") # GLOBAL FLAG FOCUS
 
@@ -797,17 +922,58 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
     # CONFIGURATION
     # -------------------------------------------------------------------------
     def _setup_config_tab(self):
-        frame = ttk.LabelFrame(self.tab_config, text="Global Settings", padding=20)
-        frame.pack(fill="x", padx=20, pady=20)
+        # AI Provider Selection
+        provider_frame = ttk.LabelFrame(self.tab_config, text="AI Provider", padding=20)
+        provider_frame.pack(fill="x", padx=20, pady=10)
 
-        ttk.Label(frame, text="OpenAI API Key:").grid(row=0, column=0, sticky="w", pady=10)
-        ttk.Entry(frame, textvariable=self.api_key_var, width=60, show="*").grid(row=0, column=1, padx=10)
+        ttk.Label(provider_frame, text="Active Provider:").grid(row=0, column=0, sticky="w", pady=10)
+        provider_combo = ttk.Combobox(provider_frame, textvariable=self.provider_var, values=PROVIDER_OPTIONS, state="readonly", width=20)
+        provider_combo.grid(row=0, column=1, padx=10, sticky="w")
+        provider_combo.bind("<<ComboboxSelected>>", lambda e: self._on_provider_changed())
 
-        ttk.Label(frame, text="Log Analytics Workspace ID:").grid(row=1, column=0, sticky="w", pady=10)
-        ttk.Entry(frame, textvariable=self.workspace_id_var, width=60).grid(row=1, column=1, padx=10)
+        # API Keys for all providers
+        keys_frame = ttk.LabelFrame(self.tab_config, text="API Keys", padding=20)
+        keys_frame.pack(fill="x", padx=20, pady=10)
 
-        ttk.Label(frame, text="(Required for SOC Agent tab only)").grid(row=1, column=2, sticky="w")
-        ttk.Button(frame, text="Save / Validate", command=lambda: messagebox.showinfo("Info", "Settings ready in memory.")).grid(row=2, column=1, pady=20)
+        ttk.Label(keys_frame, text="OpenAI API Key:").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Entry(keys_frame, textvariable=self.api_key_vars["OpenAI"], width=60, show="*").grid(row=0, column=1, padx=10)
+
+        ttk.Label(keys_frame, text="Gemini API Key:").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Entry(keys_frame, textvariable=self.api_key_vars["Gemini"], width=60, show="*").grid(row=1, column=1, padx=10)
+        ttk.Label(keys_frame, text="(pip install google-generativeai)").grid(row=1, column=2, sticky="w")
+
+        ttk.Label(keys_frame, text="Claude API Key:").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Entry(keys_frame, textvariable=self.api_key_vars["Claude"], width=60, show="*").grid(row=2, column=1, padx=10)
+        ttk.Label(keys_frame, text="(pip install anthropic)").grid(row=2, column=2, sticky="w")
+
+        # Azure settings
+        frame = ttk.LabelFrame(self.tab_config, text="Azure Settings", padding=20)
+        frame.pack(fill="x", padx=20, pady=10)
+
+        ttk.Label(frame, text="Log Analytics Workspace ID:").grid(row=0, column=0, sticky="w", pady=10)
+        ttk.Entry(frame, textvariable=self.workspace_id_var, width=60).grid(row=0, column=1, padx=10)
+
+        ttk.Label(frame, text="(Required for SOC Agent tab only)").grid(row=0, column=2, sticky="w")
+        ttk.Button(frame, text="Save / Validate", command=lambda: messagebox.showinfo("Info", "Settings ready in memory.")).grid(row=1, column=1, pady=20)
+
+    def _get_provider(self):
+        """Return the currently selected AI provider name."""
+        return self.provider_var.get()
+
+    def _get_api_key(self):
+        """Return the API key for the currently selected provider."""
+        return self.api_key_vars[self.provider_var.get()].get()
+
+    def _on_provider_changed(self):
+        """Called when the user changes the AI provider dropdown."""
+        provider = self.provider_var.get()
+        default_model = PROVIDER_DEFAULTS.get(provider, "gpt-4o")
+        models = PROVIDER_MODELS.get(provider, MODEL_OPTIONS)
+
+        # Update all model dropdowns
+        for model_var, combo in self._model_combos:
+            model_var.set(default_model)
+            combo['values'] = models
 
     # -------------------------------------------------------------------------
     # HINTS (UPDATED)
@@ -830,7 +996,9 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         opts_frame.grid(row=1, column=2, sticky="nw", padx=5)
 
         ttk.Label(opts_frame, text="Model:").pack(anchor="w")
-        ttk.OptionMenu(opts_frame, self.hint_model_var, DEFAULT_MODEL, *MODEL_OPTIONS).pack(fill="x")
+        hint_model_combo = ttk.Combobox(opts_frame, textvariable=self.hint_model_var, values=PROVIDER_MODELS.get(self.provider_var.get(), MODEL_OPTIONS), state="readonly", width=25)
+        hint_model_combo.pack(fill="x")
+        self._model_combos.append((self.hint_model_var, hint_model_combo))
         ttk.Button(opts_frame, text="Analyze Hint", command=self.hint_analyze).pack(fill="x", pady=5)
 
         bot_frame = ttk.LabelFrame(self.tab_hints, text="Active Hints & Generated Context", padding=10)
@@ -850,7 +1018,6 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
 
     def _hint_thread(self, hint_text, flag_id):
         try:
-            client = OpenAI(api_key=self.api_key_var.get())
             model = self.hint_model_var.get()
             prompt = f"""
             You are a CTF Assistant. The user has a hint for {flag_id}: "{hint_text}".
@@ -858,10 +1025,11 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
             2. Generate a specific KQL query to find it in Azure Sentinel.
             Return JSON: {{ "clue": "...", "kql": "..." }}
             """
-            resp = client.chat.completions.create(
-                model=model, messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"}
+            content = ai_chat_completion(
+                self._get_provider(), self._get_api_key(), model,
+                [{"role": "user", "content": prompt}], json_mode=True
             )
-            data = json.loads(resp.choices[0].message.content)
+            data = json.loads(content)
             entry = {"id": flag_id, "hint": hint_text, "clue": data.get("clue"), "kql": data.get("kql")}
             self.ctf_hints.append(entry)
             self.root.after(0, lambda: self._update_hint_ui(entry))
@@ -921,7 +1089,7 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
     def update_flag_bank_ai(self):
         if not self.verified_flags_data and not self.ctf_hints:
             return
-        if not self.api_key_var.get():
+        if not self._get_api_key():
             return
 
         # Get data on main thread
@@ -935,8 +1103,6 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
 
     def _flag_bank_ai_thread(self, flags, hints):
         try:
-            client = OpenAI(api_key=self.api_key_var.get())
-
             context_str = "VERIFIED FACTS:\n" + "\n".join([f"- {f['title']}: {f['note']}" for f in flags])
             context_str += "\n\nKNOWN HINTS:\n" + "\n".join([f"- {h['hint']}" for h in hints])
 
@@ -952,11 +1118,12 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
             {context_str}
             """
 
-            response = client.chat.completions.create(
-                model=DEFAULT_MODEL,
-                messages=[{"role": "user", "content": prompt}]
+            provider = self._get_provider()
+            model = PROVIDER_DEFAULTS.get(provider, DEFAULT_MODEL)
+            narrative = ai_chat_completion(
+                provider, self._get_api_key(), model,
+                [{"role": "user", "content": prompt}]
             )
-            narrative = response.choices[0].message.content
 
             self.root.after(0, lambda: self._update_flag_bank_ui(narrative))
 
@@ -1001,7 +1168,9 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         opts_frame.pack(side="right", fill="y")
 
         ttk.Label(opts_frame, text="AI Model:").pack(anchor="w")
-        ttk.OptionMenu(opts_frame, self.th_model_var, DEFAULT_MODEL, *MODEL_OPTIONS).pack(fill="x", pady=2)
+        th_model_combo = ttk.Combobox(opts_frame, textvariable=self.th_model_var, values=PROVIDER_MODELS.get(self.provider_var.get(), MODEL_OPTIONS), state="readonly", width=25)
+        th_model_combo.pack(fill="x", pady=2)
+        self._model_combos.append((self.th_model_var, th_model_combo))
 
         ttk.Button(opts_frame, text="Add Files...", command=self.th_add_files).pack(fill="x", pady=2)
         ttk.Button(opts_frame, text="Clear List", command=self.th_clear_files).pack(fill="x", pady=2)
@@ -1053,7 +1222,7 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         if not self.th_files:
             messagebox.showerror("Error", "No files loaded.")
             return
-        if not self.api_key_var.get():
+        if not self._get_api_key():
             messagebox.showerror("Error", "Missing API Key in Configuration tab.")
             return
 
@@ -1091,7 +1260,6 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
             self.th_current_idx = end_idx
 
             try:
-                client = OpenAI(api_key=self.api_key_var.get())
                 model = self.th_model_var.get()
 
                 # USE ACTIVE HINTS
@@ -1114,10 +1282,11 @@ If no flags found, return: {{ "findings": [] }}
 
 LOGS:
 {batch_text[:15000]}"""
-                resp = client.chat.completions.create(
-                    model=model, messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"}
+                content = ai_chat_completion(
+                    self._get_provider(), self._get_api_key(), model,
+                    [{"role": "user", "content": prompt}], json_mode=True
                 )
-                data = json.loads(resp.choices[0].message.content)
+                data = json.loads(content)
                 findings = data.get("findings", [])
                 for f in findings:
                     if f.get("title") not in self.th_found_flags:
@@ -1185,12 +1354,11 @@ LOGS:
             # Draft Note
             suggested_note = ""
             try:
-                if not self.api_key_var.get():
+                if not self._get_api_key():
                     raise ValueError("API key not configured")
                 # Use the findings specific evidence if available
                 evidence = data.get("Evidence", str(data))
 
-                client = OpenAI(api_key=self.api_key_var.get())
                 prompt = f"""Context: CTF Investigation. Focus: {focus_id}.
 Hint provided: "{relevant_hint}"
 
@@ -1205,12 +1373,14 @@ If a flag_answer is provided, include it verbatim in your note.
 Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
 """
 
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini", # Fast model
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=60
-                )
-                suggested_note = response.choices[0].message.content.strip()
+                provider = self._get_provider()
+                # Use a fast model for note generation
+                fast_models = {"OpenAI": "gpt-4o-mini", "Gemini": "gemini-2.0-flash", "Claude": "claude-haiku-4-5-20251001"}
+                fast_model = fast_models.get(provider, PROVIDER_DEFAULTS.get(provider, DEFAULT_MODEL))
+                suggested_note = ai_chat_completion(
+                    provider, self._get_api_key(), fast_model,
+                    [{"role": "user", "content": prompt}], max_tokens=60
+                ).strip()
             except Exception as ai_e:
                 print(f"Note Gen Error: {ai_e}")
                 if flag_answer:
@@ -1274,7 +1444,9 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         top_ctrl.pack(fill="x", pady=2)
         ttk.Label(top_ctrl, text="Instruction / Query:").pack(side="left")
         ttk.Label(top_ctrl, text="Model:").pack(side="right")
-        ttk.OptionMenu(top_ctrl, self.soc_model_var, DEFAULT_MODEL, *MODEL_OPTIONS).pack(side="right")
+        soc_model_combo = ttk.Combobox(top_ctrl, textvariable=self.soc_model_var, values=PROVIDER_MODELS.get(self.provider_var.get(), MODEL_OPTIONS), state="readonly", width=25)
+        soc_model_combo.pack(side="right")
+        self._model_combos.append((self.soc_model_var, soc_model_combo))
 
         self.soc_prompt_text = tk.Text(ctrl_frame, height=3, font=("Consolas", 10), wrap="word")
         self.soc_prompt_text.pack(fill="x", pady=2)
@@ -1291,7 +1463,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         ttk.Button(btn_box, text="🩹 Self-Heal Last KQL", command=self.soc_self_heal).pack(side="right", padx=2)
 
     def _soc_precheck(self):
-        if not self.api_key_var.get() or not self.workspace_id_var.get():
+        if not self._get_api_key() or not self.workspace_id_var.get():
             messagebox.showerror("Config Error", "Please set API Key and Workspace ID in Configuration Tab.")
             return False
         return True
@@ -1370,7 +1542,8 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
 
         self.soc_print(f"Processing in batches of {batch_size}...")
 
-        client = OpenAI(api_key=self.api_key_var.get())
+        provider = self._get_provider()
+        api_key = self._get_api_key()
         all_findings = []
 
         # Use Active Focus Hints
@@ -1393,7 +1566,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                 current_ignore_list.add(f.get('title'))
 
             try:
-                batch_findings = hunt_on_records(client, batch_records, table_name, model, active_hints, current_ignore_list, focus)
+                batch_findings = hunt_on_records(provider, api_key, batch_records, table_name, model, active_hints, current_ignore_list, focus)
 
                 new_count = 0
                 if batch_findings:
@@ -1448,7 +1621,8 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         self.soc_print(f"Goal: {user_input}")
 
         try:
-            client = OpenAI(api_key=self.api_key_var.get())
+            provider = self._get_provider()
+            api_key = self._get_api_key()
             law_client = LogsQueryClient(credential=DefaultAzureCredential())
             model = self.soc_model_var.get()
 
@@ -1465,7 +1639,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
 
             # --- SMART MODE vs SAFE MODE LOGIC ---
             # 1. Ask AI for query
-            ctx = get_query_context(client, user_input, model, self.soc_memory, active_hints, focus, incident_ctx)
+            ctx = get_query_context(provider, api_key, user_input, model, self.soc_memory, active_hints, focus, incident_ctx)
 
             if self._ai_cancelled():
                 self.soc_print(f"{Fore.YELLOW}--- AI INVESTIGATION STOPPED ---{Fore.RESET}")
@@ -1519,7 +1693,8 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
 
     def _soc_kql_only_thread(self, user_input):
         try:
-            client = OpenAI(api_key=self.api_key_var.get())
+            provider = self._get_provider()
+            api_key = self._get_api_key()
             model = self.soc_model_var.get()
             active_hints = self.get_active_hints()
             focus = self.active_flag_var.get()
@@ -1527,7 +1702,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             # Get Accumulated Report Context
             incident_ctx = self._get_incident_context_for_kql()
 
-            ctx = get_query_context(client, user_input, model, self.soc_memory, active_hints, focus, incident_ctx)
+            ctx = get_query_context(provider, api_key, user_input, model, self.soc_memory, active_hints, focus, incident_ctx)
             # Update last KQL for self-healing manual runs
             self.last_kql = ctx.get('kql_query')
             self.soc_print(f"\n{Fore.YELLOW}KQL Preview:\n{ctx.get('kql_query')}{Fore.RESET}")
@@ -1607,7 +1782,6 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
 
     def _soc_self_heal_thread(self):
         try:
-            client = OpenAI(api_key=self.api_key_var.get())
             prompt = f"""
             You are a KQL Expert. The following query failed or returned no results.
 
@@ -1624,12 +1798,11 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             Return JSON: {{ "fixed_kql": "...", "explanation": "..." }}
             """
 
-            response = client.chat.completions.create(
-                model=self.soc_model_var.get(),
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"}
+            content = ai_chat_completion(
+                self._get_provider(), self._get_api_key(), self.soc_model_var.get(),
+                [{"role": "user", "content": prompt}], json_mode=True
             )
-            data = json.loads(response.choices[0].message.content)
+            data = json.loads(content)
             fixed_kql = data.get("fixed_kql", "")
             explanation = data.get("explanation", "")
 
@@ -1726,7 +1899,9 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         ttk.Button(input_frame, text="Browse", command=self.ir_browse_file).grid(row=0, column=2, padx=5)
 
         ttk.Label(input_frame, text="Model:").grid(row=0, column=3, sticky="e")
-        ttk.OptionMenu(input_frame, self.ir_model_var, DEFAULT_MODEL, *MODEL_OPTIONS).grid(row=0, column=4, padx=5)
+        ir_model_combo = ttk.Combobox(input_frame, textvariable=self.ir_model_var, values=PROVIDER_MODELS.get(self.provider_var.get(), MODEL_OPTIONS), state="readonly", width=25)
+        ir_model_combo.grid(row=0, column=4, padx=5)
+        self._model_combos.append((self.ir_model_var, ir_model_combo))
 
         # Internal data sources panel
         src_frame = ttk.LabelFrame(self.tab_incident, text="Internal Data Sources (auto-included)", padding=10)
@@ -1826,7 +2001,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         return "\n\n".join(sections), source_counts
 
     def ir_generate(self):
-        if not self.api_key_var.get():
+        if not self._get_api_key():
             messagebox.showerror("Error", "Missing API Key in Configuration tab.")
             return
 
@@ -1868,7 +2043,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
 
     def auto_generate_incident_report(self):
         """Automatically runs the report generation with current data."""
-        if not self.api_key_var.get():
+        if not self._get_api_key():
             return
 
         filepath = self.ir_file_var.get()
@@ -1937,13 +2112,11 @@ TASK 2: INVESTIGATION REPORT
 === REPORT TEMPLATE ===
 {template_content}
 """
-            client = OpenAI(api_key=self.api_key_var.get())
-            response = client.chat.completions.create(
-                model=self.ir_model_var.get(),
-                messages=[{"role": "system", "content": SYSTEM_PROMPT_INCIDENT_REPORT}, {"role": "user", "content": user_prompt}],
+            report = ai_chat_completion(
+                self._get_provider(), self._get_api_key(), self.ir_model_var.get(),
+                [{"role": "system", "content": SYSTEM_PROMPT_INCIDENT_REPORT}, {"role": "user", "content": user_prompt}],
                 temperature=0.3
             )
-            report = response.choices[0].message.content
             self._ir_update_output(report, clear=True)
         except Exception as e:
             self._ir_update_output(f"Error during generation: {e}")
@@ -2021,17 +2194,24 @@ PREREQUISITES
   - Required libraries (install with pip):
       pip install openai pypdf azure-identity azure-monitor-query pandas
       pip install colorama python-docx
-  - An OpenAI API key (get one at https://platform.openai.com)
+  - Optional AI providers (install as needed):
+      pip install anthropic          (for Claude support)
+      pip install google-generativeai (for Gemini support)
+  - An API key for your chosen AI provider:
+      OpenAI: https://platform.openai.com
+      Google Gemini: https://aistudio.google.com
+      Anthropic Claude: https://console.anthropic.com
   - An Azure Log Analytics Workspace ID (for the SOC Agent tab)
   - Azure credentials configured (az login, or environment variables)
 
 FIRST LAUNCH
   1. Run the tool:  python unifiedsoctool.py
   2. Go to the "Configuration" tab.
-  3. Paste your OpenAI API key.
-  4. Paste your Log Analytics Workspace ID.
-  5. Click "Save / Validate".
-  6. You are now ready to use all features.
+  3. Select your AI Provider (OpenAI, Gemini, or Claude).
+  4. Paste the corresponding API key.
+  5. Paste your Log Analytics Workspace ID (for SOC Agent tab).
+  6. Click "Save / Validate".
+  7. You are now ready to use all features.
 
 
 ================================================================================
@@ -2041,14 +2221,16 @@ FIRST LAUNCH
 --------------------------------------------------------------------------------
 2a. CONFIGURATION TAB
 --------------------------------------------------------------------------------
-  PURPOSE: Store your API key and Workspace ID in memory.
+  PURPOSE: Store your AI provider settings and API keys in memory.
 
   HOW TO USE:
-  - Paste your OpenAI API key in the first field (masked for security).
-  - Paste your Azure Log Analytics Workspace ID in the second field.
+  - Select your AI Provider (OpenAI, Gemini, or Claude).
+  - Paste your API key(s) in the corresponding field(s) (masked for security).
+  - Paste your Azure Log Analytics Workspace ID in the Azure Settings section.
   - Click "Save / Validate" to confirm settings are loaded.
   - These credentials are NOT saved to disk unless you use Session Manager.
-  - Tip: The API key can also be set via the OPENAI_API_KEY env variable.
+  - Tip: API keys can be set via environment variables:
+    OPENAI_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY
 
 
 --------------------------------------------------------------------------------
@@ -2288,7 +2470,8 @@ FIRST LAUNCH
     The tool searches up to 1 year by default.
   - "Query failed": Click "Self-Heal Last KQL". The AI will diagnose and
     fix the syntax error.
-  - "API key error": Make sure your OpenAI key is valid and has credits.
+  - "API key error": Make sure your API key is valid and has credits.
+    Ensure the correct provider is selected in the Configuration tab.
   - "Azure auth error": Run "az login" in your terminal first, or set
     Azure credential environment variables.
   - "Missing library": Run the pip install command shown at startup.
@@ -2306,7 +2489,10 @@ FIRST LAUNCH
     def save_full_session(self):
         data = {
             "config": {
-                "api_key": self.api_key_var.get(),
+                "provider": self.provider_var.get(),
+                "api_key_openai": self.api_key_vars["OpenAI"].get(),
+                "api_key_gemini": self.api_key_vars["Gemini"].get(),
+                "api_key_claude": self.api_key_vars["Claude"].get(),
                 "workspace_id": self.workspace_id_var.get()
             },
             "hints": {
@@ -2352,8 +2538,18 @@ FIRST LAUNCH
             with open(f, 'r') as file: data = json.load(file)
 
             if "config" in data:
-                self.api_key_var.set(data["config"].get("api_key", ""))
-                self.workspace_id_var.set(data["config"].get("workspace_id", ""))
+                cfg = data["config"]
+                self.provider_var.set(cfg.get("provider", "OpenAI"))
+                # Support both old single-key and new multi-key formats
+                if "api_key_openai" in cfg:
+                    self.api_key_vars["OpenAI"].set(cfg.get("api_key_openai", ""))
+                    self.api_key_vars["Gemini"].set(cfg.get("api_key_gemini", ""))
+                    self.api_key_vars["Claude"].set(cfg.get("api_key_claude", ""))
+                elif "api_key" in cfg:
+                    # Legacy format: single OpenAI key
+                    self.api_key_vars["OpenAI"].set(cfg.get("api_key", ""))
+                self.workspace_id_var.set(cfg.get("workspace_id", ""))
+                self._on_provider_changed()
 
             if "hints" in data:
                 self.ctf_hints = data["hints"].get("ctf_hints", [])
