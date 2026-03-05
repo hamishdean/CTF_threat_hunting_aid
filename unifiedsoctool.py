@@ -316,9 +316,9 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         if max_tokens:
-            # Newer OpenAI models (o1, o3, etc.) require max_completion_tokens
-            o_series = model.startswith(("o1", "o3", "o4"))
-            token_param = "max_completion_tokens" if o_series else "max_tokens"
+            # Newer OpenAI models (o-series, gpt-5) require max_completion_tokens
+            needs_completion_tokens = model.startswith(("o1", "o3", "o4", "gpt-5"))
+            token_param = "max_completion_tokens" if needs_completion_tokens else "max_tokens"
             kwargs[token_param] = max_tokens
         if temperature is not None:
             kwargs["temperature"] = temperature
