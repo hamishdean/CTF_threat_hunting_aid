@@ -823,6 +823,7 @@ class UnifiedSOCTool:
         self.api_key_var = self.api_key_vars["OpenAI"]
         self.workspace_id_var = tk.StringVar(value="")
         self._model_combos = []  # List of (model_var, combo_widget) for provider switching
+        self.custom_models = {"OpenAI": [], "Gemini": [], "Claude": []}  # User-added model names
 
         self.active_flag_var = tk.StringVar(value="General/All") # GLOBAL FLAG FOCUS
 
@@ -934,6 +935,26 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         provider_combo.grid(row=0, column=1, padx=10, sticky="w")
         provider_combo.bind("<<ComboboxSelected>>", lambda e: self._on_provider_changed())
 
+        # Custom Model Entry
+        model_frame = ttk.LabelFrame(self.tab_config, text="Custom AI Models", padding=20)
+        model_frame.pack(fill="x", padx=20, pady=10)
+
+        ttk.Label(model_frame, text="Add a model ID not yet in the built-in list (e.g. gpt-6, claude-opus-5):").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 5))
+
+        ttk.Label(model_frame, text="Model ID:").grid(row=1, column=0, sticky="w", pady=5)
+        self.custom_model_entry = ttk.Entry(model_frame, width=40)
+        self.custom_model_entry.grid(row=1, column=1, padx=10, sticky="w")
+        ttk.Button(model_frame, text="Add to Current Provider", command=self._add_custom_model).grid(row=1, column=2, padx=10)
+
+        ttk.Label(model_frame, text="Custom models for current provider:").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.custom_models_label = ttk.Label(model_frame, text="(none)", foreground="gray")
+        self.custom_models_label.grid(row=2, column=1, columnspan=2, sticky="w", padx=10, pady=(10, 0))
+
+        ttk.Button(model_frame, text="Remove Selected Custom Model", command=self._remove_custom_model).grid(row=3, column=2, padx=10, pady=5)
+        self.remove_model_entry = ttk.Entry(model_frame, width=40)
+        self.remove_model_entry.grid(row=3, column=1, padx=10, sticky="w")
+        ttk.Label(model_frame, text="Model to remove:").grid(row=3, column=0, sticky="w", pady=5)
+
         # API Keys for all providers
         keys_frame = ttk.LabelFrame(self.tab_config, text="API Keys", padding=20)
         keys_frame.pack(fill="x", padx=20, pady=10)
@@ -967,16 +988,85 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         """Return the API key for the currently selected provider."""
         return self.api_key_vars[self.provider_var.get()].get()
 
+    def _get_models_for_provider(self, provider=None):
+        """Return built-in + custom models for the given provider."""
+        if provider is None:
+            provider = self.provider_var.get()
+        built_in = list(PROVIDER_MODELS.get(provider, MODEL_OPTIONS))
+        custom = self.custom_models.get(provider, [])
+        return built_in + custom
+
     def _on_provider_changed(self):
         """Called when the user changes the AI provider dropdown."""
         provider = self.provider_var.get()
         default_model = PROVIDER_DEFAULTS.get(provider, "gpt-4o")
-        models = PROVIDER_MODELS.get(provider, MODEL_OPTIONS)
+        models = self._get_models_for_provider(provider)
 
         # Update all model dropdowns
         for model_var, combo in self._model_combos:
             model_var.set(default_model)
             combo['values'] = models
+
+        self._update_custom_models_label()
+
+    def _add_custom_model(self):
+        """Add a user-entered model ID to the current provider's model list."""
+        model_id = self.custom_model_entry.get().strip()
+        if not model_id:
+            messagebox.showwarning("No Model ID", "Please enter a model ID.")
+            return
+
+        provider = self.provider_var.get()
+        all_models = self._get_models_for_provider(provider)
+
+        if model_id in all_models:
+            messagebox.showinfo("Already Exists", f"'{model_id}' is already available for {provider}.")
+            return
+
+        self.custom_models[provider].append(model_id)
+        updated_models = self._get_models_for_provider(provider)
+
+        # Update all model dropdowns to include the new model
+        for model_var, combo in self._model_combos:
+            combo['values'] = updated_models
+
+        self.custom_model_entry.delete(0, "end")
+        self._update_custom_models_label()
+        messagebox.showinfo("Model Added", f"'{model_id}' added to {provider}. You can now select it in any tab's model dropdown.")
+
+    def _remove_custom_model(self):
+        """Remove a custom model from the current provider's list."""
+        model_id = self.remove_model_entry.get().strip()
+        if not model_id:
+            messagebox.showwarning("No Model ID", "Please enter the model ID to remove.")
+            return
+
+        provider = self.provider_var.get()
+        if model_id not in self.custom_models.get(provider, []):
+            messagebox.showwarning("Not Found", f"'{model_id}' is not a custom model for {provider}.")
+            return
+
+        self.custom_models[provider].remove(model_id)
+        updated_models = self._get_models_for_provider(provider)
+
+        for model_var, combo in self._model_combos:
+            combo['values'] = updated_models
+            # If the removed model was selected, reset to default
+            if model_var.get() == model_id:
+                model_var.set(PROVIDER_DEFAULTS.get(provider, "gpt-4o"))
+
+        self.remove_model_entry.delete(0, "end")
+        self._update_custom_models_label()
+        messagebox.showinfo("Model Removed", f"'{model_id}' removed from {provider}.")
+
+    def _update_custom_models_label(self):
+        """Update the label showing custom models for the current provider."""
+        provider = self.provider_var.get()
+        custom = self.custom_models.get(provider, [])
+        if custom:
+            self.custom_models_label.config(text=", ".join(custom), foreground="black")
+        else:
+            self.custom_models_label.config(text="(none)", foreground="gray")
 
     # -------------------------------------------------------------------------
     # HINTS (UPDATED)
@@ -999,7 +1089,7 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         opts_frame.grid(row=1, column=2, sticky="nw", padx=5)
 
         ttk.Label(opts_frame, text="Model:").pack(anchor="w")
-        hint_model_combo = ttk.Combobox(opts_frame, textvariable=self.hint_model_var, values=PROVIDER_MODELS.get(self.provider_var.get(), MODEL_OPTIONS), state="readonly", width=25)
+        hint_model_combo = ttk.Combobox(opts_frame, textvariable=self.hint_model_var, values=self._get_models_for_provider(), state="readonly", width=25)
         hint_model_combo.pack(fill="x")
         self._model_combos.append((self.hint_model_var, hint_model_combo))
         ttk.Button(opts_frame, text="Analyze Hint", command=self.hint_analyze).pack(fill="x", pady=5)
@@ -1171,7 +1261,7 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         opts_frame.pack(side="right", fill="y")
 
         ttk.Label(opts_frame, text="AI Model:").pack(anchor="w")
-        th_model_combo = ttk.Combobox(opts_frame, textvariable=self.th_model_var, values=PROVIDER_MODELS.get(self.provider_var.get(), MODEL_OPTIONS), state="readonly", width=25)
+        th_model_combo = ttk.Combobox(opts_frame, textvariable=self.th_model_var, values=self._get_models_for_provider(), state="readonly", width=25)
         th_model_combo.pack(fill="x", pady=2)
         self._model_combos.append((self.th_model_var, th_model_combo))
 
@@ -1447,7 +1537,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         top_ctrl.pack(fill="x", pady=2)
         ttk.Label(top_ctrl, text="Instruction / Query:").pack(side="left")
         ttk.Label(top_ctrl, text="Model:").pack(side="right")
-        soc_model_combo = ttk.Combobox(top_ctrl, textvariable=self.soc_model_var, values=PROVIDER_MODELS.get(self.provider_var.get(), MODEL_OPTIONS), state="readonly", width=25)
+        soc_model_combo = ttk.Combobox(top_ctrl, textvariable=self.soc_model_var, values=self._get_models_for_provider(), state="readonly", width=25)
         soc_model_combo.pack(side="right")
         self._model_combos.append((self.soc_model_var, soc_model_combo))
 
@@ -1902,7 +1992,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         ttk.Button(input_frame, text="Browse", command=self.ir_browse_file).grid(row=0, column=2, padx=5)
 
         ttk.Label(input_frame, text="Model:").grid(row=0, column=3, sticky="e")
-        ir_model_combo = ttk.Combobox(input_frame, textvariable=self.ir_model_var, values=PROVIDER_MODELS.get(self.provider_var.get(), MODEL_OPTIONS), state="readonly", width=25)
+        ir_model_combo = ttk.Combobox(input_frame, textvariable=self.ir_model_var, values=self._get_models_for_provider(), state="readonly", width=25)
         ir_model_combo.grid(row=0, column=4, padx=5)
         self._model_combos.append((self.ir_model_var, ir_model_combo))
 
@@ -2496,7 +2586,8 @@ FIRST LAUNCH
                 "api_key_openai": self.api_key_vars["OpenAI"].get(),
                 "api_key_gemini": self.api_key_vars["Gemini"].get(),
                 "api_key_claude": self.api_key_vars["Claude"].get(),
-                "workspace_id": self.workspace_id_var.get()
+                "workspace_id": self.workspace_id_var.get(),
+                "custom_models": self.custom_models
             },
             "hints": {
                 "ctf_hints": self.ctf_hints,
@@ -2552,6 +2643,10 @@ FIRST LAUNCH
                     # Legacy format: single OpenAI key
                     self.api_key_vars["OpenAI"].set(cfg.get("api_key", ""))
                 self.workspace_id_var.set(cfg.get("workspace_id", ""))
+                # Restore custom models before triggering provider change
+                saved_custom = cfg.get("custom_models", {})
+                for provider in self.custom_models:
+                    self.custom_models[provider] = saved_custom.get(provider, [])
                 self._on_provider_changed()
 
             if "hints" in data:
