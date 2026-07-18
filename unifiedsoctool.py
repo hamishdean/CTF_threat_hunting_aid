@@ -163,7 +163,7 @@ class AzureSentinelFormatter:
     @staticmethod
     def format_log(finding: dict) -> str:
         formatted = {
-            "TimeGenerated": finding.get("timestamp", "2025-12-01T00:00:00Z"),
+            "TimeGenerated": finding.get("timestamp", ""),
             "AlertName": finding.get("title", "Unknown Alert"),
             "FlagAnswer": finding.get("flag_answer", ""),
             "Description": finding.get("description", ""),
@@ -1647,30 +1647,45 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         threading.Thread(target=self._th_read_then_hunt, daemon=True).start()
 
     def _th_read_then_hunt(self):
-        for f in self.th_files:
-            if self._ai_cancelled():
-                self.root.after(0, lambda: self.th_status_lbl.config(text="Hunt stopped by user."))
+        try:
+            for f in self.th_files:
+                if self._ai_cancelled():
+                    self.root.after(0, lambda: self.th_status_lbl.config(text="Hunt stopped by user."))
+                    self._set_ai_running(False)
+                    return
+                base = os.path.basename(f)
+                self.root.after(0, lambda n=base: self.th_status_lbl.config(text=f"Reading {n}..."))
+                pages = extract_text_from_file(f)
+                for i, page in enumerate(pages, 1):
+                    self.th_pages_buffer.append(page)
+                    self.th_pages_source.append(f"{base} p{i}")
+
+            if not self.th_pages_buffer:
+                self.root.after(0, lambda: messagebox.showerror("Error", "No text could be extracted."))
+                self.root.after(0, lambda: self.th_status_lbl.config(text="Status: Idle"))
                 self._set_ai_running(False)
                 return
-            base = os.path.basename(f)
-            self.root.after(0, lambda n=base: self.th_status_lbl.config(text=f"Reading {n}..."))
-            pages = extract_text_from_file(f)
-            for i, page in enumerate(pages, 1):
-                self.th_pages_buffer.append(page)
-                self.th_pages_source.append(f"{base} p{i}")
 
-        if not self.th_pages_buffer:
-            self.root.after(0, lambda: messagebox.showerror("Error", "No text could be extracted."))
+            self.root.after(0, lambda: self.th_status_lbl.config(
+                text=f"Processing {len(self.th_pages_buffer)} pages/chunks..."))
+            # Continue processing in this same worker thread.
+            self.th_process_batch_thread()
+        except Exception as e:
+            # Never leave the hunt buttons stuck disabled if reading blows up.
+            self.root.after(0, lambda m=f"[!] Hunt could not start: {e}": self.th_log_history(m))
             self.root.after(0, lambda: self.th_status_lbl.config(text="Status: Idle"))
             self._set_ai_running(False)
-            return
-
-        self.root.after(0, lambda: self.th_status_lbl.config(
-            text=f"Processing {len(self.th_pages_buffer)} pages/chunks..."))
-        # Continue processing in this same worker thread.
-        self.th_process_batch_thread()
 
     def th_process_batch_thread(self):
+        # Guard so an unexpected error can never leave the hunt buttons stuck disabled.
+        try:
+            self._th_process_batch_impl()
+        except Exception as e:
+            self.root.after(0, lambda m=f"[!] Hunt aborted unexpectedly: {e}": self.th_log_history(m))
+            self.root.after(0, lambda: self.th_status_lbl.config(text="Status: Idle"))
+            self._set_ai_running(False)
+
+    def _th_process_batch_impl(self):
         PAGE_CAP = 4          # never send more than this many pages at once
         CHAR_BUDGET = 12000   # ...or more than roughly this many characters
         HARD_CAP = 20000      # absolute ceiling for a single oversized page
@@ -1703,6 +1718,10 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
                 source_label = src_slice[0]
             else:
                 source_label = f"{src_slice[0]} … {src_slice[-1]}"
+
+            # Show progress like the SOC batch loop (E-F).
+            self.root.after(0, lambda a=start_idx + 1, b=self.th_current_idx, n=len(self.th_pages_buffer):
+                            self.th_status_lbl.config(text=f"Analyzing pages {a}-{b} of {n}..."))
 
             try:
                 model = self.th_model_var.get()
@@ -1866,8 +1885,13 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             print(f"Note Gen Error: {ai_e}")
             suggested_note = f"Flag answer: {flag_answer}" if flag_answer else f"Found {title}. Evidence: {str(evidence)[:120]}"
 
-        # Hand back to the UI thread to show the dialog and save.
-        self.root.after(0, lambda: self._th_finish_verify(title, description, focus_id, suggested_note, source))
+        # Hand back to the UI thread to show the dialog and save. Guard the handoff so
+        # a failure here can't leave the Verify button permanently wedged.
+        try:
+            self.root.after(0, lambda: self._th_finish_verify(title, description, focus_id, suggested_note, source))
+        except Exception as e:
+            print(f"Verify handoff error: {e}")
+            self._th_verifying = False
 
     def _th_finish_verify(self, title, description, focus_id, suggested_note, source=""):
         try:
@@ -1945,6 +1969,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         ttk.Button(btn_box, text="Open Manual KQL Editor", command=self.soc_open_manual_kql).pack(side="left", padx=2)
         ttk.Button(btn_box, text="💾 Export Log to File", command=self.soc_export_log).pack(side="right", padx=2)
         ttk.Button(btn_box, text="🩹 Self-Heal Last KQL", command=self.soc_self_heal).pack(side="right", padx=2)
+        ttk.Button(btn_box, text="🧹 Clear Console", command=self.soc_clear_console).pack(side="right", padx=2)
 
     def _soc_precheck(self):
         if not HAS_AZURE:
@@ -2366,6 +2391,12 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             else:
                 messagebox.showerror("Error", "Failed to save file.")
 
+    def soc_clear_console(self):
+        """Empty the SOC Agent console output."""
+        self.soc_console.config(state="normal")
+        self.soc_console.delete("1.0", "end")
+        self.soc_console.config(state="disabled")
+
     # -------------------------------------------------------------------------
     # IOC EXTRACTOR (NEW)
     # -------------------------------------------------------------------------
@@ -2538,6 +2569,33 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         btn_box = ttk.Frame(frame)
         btn_box.pack(fill="x", pady=5)
         ttk.Button(btn_box, text="Refresh Display", command=self._update_summary_display).pack(side="right")
+        ttk.Button(btn_box, text="💾 Export to .txt", command=self.summary_export).pack(side="right", padx=5)
+        ttk.Button(btn_box, text="📋 Copy", command=self.summary_copy).pack(side="right")
+
+    def summary_copy(self):
+        """Copy the findings summary to the clipboard."""
+        content = self.summary_text.get("1.0", "end").strip()
+        if not content:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content)
+        messagebox.showinfo("Copied", "Findings summary copied to clipboard.")
+
+    def summary_export(self):
+        """Save the findings summary to a text file."""
+        content = self.summary_text.get("1.0", "end").strip()
+        if not content:
+            messagebox.showinfo("Nothing to Export", "No findings to export yet.")
+            return
+        f = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text File", "*.txt")])
+        if not f:
+            return
+        try:
+            with open(f, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            messagebox.showinfo("Exported", f"Summary saved to {os.path.basename(f)}")
+        except Exception as e:
+            messagebox.showerror("Export Error", str(e))
 
     def _update_summary_display(self):
         self.summary_text.config(state="normal")
@@ -3237,7 +3295,8 @@ FIRST LAUNCH
                 "api_key_gemini": self.api_key_vars["Gemini"].get() if include_keys else "",
                 "api_key_claude": self.api_key_vars["Claude"].get() if include_keys else "",
                 "workspace_id": self.workspace_id_var.get(),
-                "custom_models": self.custom_models
+                "custom_models": self.custom_models,
+                "active_flag": self.active_flag_var.get()
             },
             "hints": {
                 "ctf_hints": self.ctf_hints,
@@ -3300,6 +3359,7 @@ FIRST LAUNCH
                     # Legacy format: single OpenAI key
                     self.api_key_vars["OpenAI"].set(cfg.get("api_key", ""))
                 self.workspace_id_var.set(cfg.get("workspace_id", ""))
+                self.active_flag_var.set(cfg.get("active_flag", "General/All"))
                 # Restore custom models before triggering provider change
                 saved_custom = cfg.get("custom_models", {})
                 for provider in self.custom_models:
