@@ -168,7 +168,8 @@ class AzureSentinelFormatter:
             "FlagAnswer": finding.get("flag_answer", ""),
             "Description": finding.get("description", ""),
             "Severity": finding.get("severity", "Medium"),
-            "Evidence": finding.get("evidence", "")
+            "Evidence": finding.get("evidence", ""),
+            "Source": finding.get("source", "")
         }
         return json.dumps(formatted, indent=2)
 
@@ -1106,6 +1107,7 @@ class UnifiedSOCTool:
 
         self.th_candidate_queue = []
         self.th_pages_buffer = []
+        self.th_pages_source = []   # parallel to th_pages_buffer: "<file> p<N>" provenance
         self.th_current_idx = 0
         self.th_model_var = tk.StringVar(value=DEFAULT_MODEL)
         self._th_complete_logged = False   # de-dupe the "Hunt complete" notice
@@ -1636,6 +1638,7 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self.th_current_idx = 0
         self.th_candidate_queue = []
         self.th_pages_buffer = []
+        self.th_pages_source = []
         self._th_complete_logged = False
         self._ai_cancel_event.clear()
         self._set_ai_running(True)
@@ -1649,8 +1652,12 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
                 self.root.after(0, lambda: self.th_status_lbl.config(text="Hunt stopped by user."))
                 self._set_ai_running(False)
                 return
-            self.root.after(0, lambda n=os.path.basename(f): self.th_status_lbl.config(text=f"Reading {n}..."))
-            self.th_pages_buffer.extend(extract_text_from_file(f))
+            base = os.path.basename(f)
+            self.root.after(0, lambda n=base: self.th_status_lbl.config(text=f"Reading {n}..."))
+            pages = extract_text_from_file(f)
+            for i, page in enumerate(pages, 1):
+                self.th_pages_buffer.append(page)
+                self.th_pages_source.append(f"{base} p{i}")
 
         if not self.th_pages_buffer:
             self.root.after(0, lambda: messagebox.showerror("Error", "No text could be extracted."))
@@ -1688,6 +1695,15 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
                 self.th_current_idx += 1
             batch_text = "\n".join(parts)[:HARD_CAP]
 
+            # Provenance label for this batch (E6): a single "<file> p<N>" or a range.
+            src_slice = self.th_pages_source[start_idx:self.th_current_idx]
+            if not src_slice:
+                source_label = ""
+            elif src_slice[0] == src_slice[-1]:
+                source_label = src_slice[0]
+            else:
+                source_label = f"{src_slice[0]} … {src_slice[-1]}"
+
             try:
                 model = self.th_model_var.get()
 
@@ -1719,6 +1735,7 @@ LOGS:
                 findings = data.get("findings", [])
                 for f in findings:
                     if f.get("title") not in self.th_found_flags:
+                        f["source"] = source_label
                         self.th_candidate_queue.append(f)
             except Exception as e:
                 err = f"[!] Analysis error on pages {start_idx + 1}-{self.th_current_idx}: {e}"
@@ -1771,7 +1788,8 @@ LOGS:
             "title": title,
             "description": description if description else "Manually added finding.",
             "timestamp": datetime.datetime.now().isoformat(),
-            "evidence": "Manual Entry"
+            "evidence": "Manual Entry",
+            "source": "Manual entry"
         }
 
         # Populate editor and let verify logic handle the rest
@@ -1807,17 +1825,18 @@ LOGS:
                     break
 
         evidence = data.get("Evidence", str(data))
+        source = data.get("Source", "")
 
         # Draft the note off the UI thread so the app stays responsive (B2).
         self._th_verifying = True
         self.th_status_lbl.config(text="Drafting Flag Note (AI)...")
         threading.Thread(
             target=self._th_note_thread,
-            args=(title, description, flag_answer, focus_id, relevant_hint, evidence),
+            args=(title, description, flag_answer, focus_id, relevant_hint, evidence, source),
             daemon=True,
         ).start()
 
-    def _th_note_thread(self, title, description, flag_answer, focus_id, relevant_hint, evidence):
+    def _th_note_thread(self, title, description, flag_answer, focus_id, relevant_hint, evidence, source):
         suggested_note = ""
         try:
             if not self._get_api_key():
@@ -1848,9 +1867,9 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             suggested_note = f"Flag answer: {flag_answer}" if flag_answer else f"Found {title}. Evidence: {str(evidence)[:120]}"
 
         # Hand back to the UI thread to show the dialog and save.
-        self.root.after(0, lambda: self._th_finish_verify(title, description, focus_id, suggested_note))
+        self.root.after(0, lambda: self._th_finish_verify(title, description, focus_id, suggested_note, source))
 
-    def _th_finish_verify(self, title, description, focus_id, suggested_note):
+    def _th_finish_verify(self, title, description, focus_id, suggested_note, source=""):
         try:
             self.th_status_lbl.config(text="Status: Idle")
             note = simpledialog.askstring(
@@ -1870,6 +1889,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                 "description": description,
                 "note": note,
                 "focus_id": focus_id,
+                "source": source,
             })
             self._update_summary_display()
 
@@ -2069,6 +2089,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             def _push_to_hunter():
                 for f in all_findings:
                     if f.get('title') not in self.th_found_flags:
+                        f["source"] = f"SOC query: {table_name}"
                         self.th_candidate_queue.append(f)
                 self.th_show_candidate()
             self.root.after(0, _push_to_hunter)
@@ -2132,6 +2153,10 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                 self.soc_print(f"{Fore.YELLOW}AI Generated KQL:{Fore.RESET}")
 
             self.soc_print(f"{kql}")
+            # Capture for Self-Heal regardless of outcome (B5): if execute_kql raises
+            # below, the except still knows which query failed and why.
+            self.last_kql = kql
+            self.last_error = ""
 
             # 3. Execute
             self.soc_print("Executing query...")
@@ -2150,11 +2175,11 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                 self.soc_last_records = results
                 self._process_results_in_batches(results, table_name, model)
             else:
-                self.last_kql = kql
                 self.last_error = "0 records found."
                 self.soc_print(f"{Fore.GREEN}0 records found.{Fore.RESET}")
 
         except Exception as e:
+            self.last_error = str(e)
             self.soc_print(f"{Fore.RED}Error: {e}{Fore.RESET}")
         finally:
             self._set_ai_running(False)
@@ -2183,9 +2208,15 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             incident_ctx = self._get_incident_context_for_kql()
 
             ctx = get_query_context(provider, api_key, user_input, model, self.soc_memory, active_hints, focus, incident_ctx)
-            # Update last KQL for self-healing manual runs
-            self.last_kql = ctx.get('kql_query')
-            self.soc_print(f"\n{Fore.YELLOW}KQL Preview:\n{ctx.get('kql_query')}{Fore.RESET}")
+            kql = ctx.get('kql_query') or ""
+            if not kql:
+                err = ctx.get('error', 'the AI did not return a query.')
+                self.soc_print(f"{Fore.RED}Could not generate KQL: {err}{Fore.RESET}")
+                return
+            # Update last KQL for self-healing / manual runs.
+            self.last_kql = kql
+            self.last_error = ""
+            self.soc_print(f"\n{Fore.YELLOW}KQL Preview:\n{kql}{Fore.RESET}")
         except Exception as e:
             self.soc_print(str(e))
 
@@ -2413,18 +2444,26 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             return
         self._ioc_set_results(extract_iocs(text), source="findings & logs")
 
-    def _ioc_set_results(self, results, source=""):
-        self.ioc_results = results
+    def _ioc_populate_tree(self, source=""):
+        """Refresh the IOC table from self.ioc_results and update the count label.
+
+        Returns the number of indicators shown. No dialogs, so it is safe to call
+        on session load (see _ioc_set_results for the interactive extract path)."""
         for item in self.ioc_tree.get_children():
             self.ioc_tree.delete(item)
         total = 0
         for category in IOC_PATTERNS:  # stable, sensible ordering
-            for value in results.get(category, []):
+            for value in self.ioc_results.get(category, []):
                 self.ioc_tree.insert("", "end", values=(category, value))
                 total += 1
         suffix = f" (from {source})" if source else ""
         self.ioc_count_lbl.config(text=f"{total} indicators{suffix}",
                                   foreground="black" if total else "gray")
+        return total
+
+    def _ioc_set_results(self, results, source=""):
+        self.ioc_results = results
+        total = self._ioc_populate_tree(source)
         if total == 0:
             messagebox.showinfo("No IOCs", "No indicators of compromise were found in that data.")
 
@@ -2512,6 +2551,8 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         for idx, item in enumerate(sorted_flags, 1):
             txt += f"{idx}. FLAG: {item['title']}\n"
             txt += f"   FOCUS: {item.get('focus_id', 'General')}\n"
+            if item.get('source'):
+                txt += f"   SOURCE: {item['source']}\n"
             txt += f"   NOTE:  {item['note']}\n"
             txt += "-"*50 + "\n"
 
@@ -2542,14 +2583,16 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         self.ir_src_hints = tk.BooleanVar(value=True)
         self.ir_src_bank = tk.BooleanVar(value=True)
         self.ir_src_soc = tk.BooleanVar(value=True)
+        self.ir_src_iocs = tk.BooleanVar(value=True)
 
         ttk.Checkbutton(src_frame, text="Verified Flags & Answers", variable=self.ir_src_flags).grid(row=0, column=0, sticky="w", padx=10)
         ttk.Checkbutton(src_frame, text="CTF Hints & Clues", variable=self.ir_src_hints).grid(row=0, column=1, sticky="w", padx=10)
         ttk.Checkbutton(src_frame, text="Flag Bank Narrative", variable=self.ir_src_bank).grid(row=0, column=2, sticky="w", padx=10)
         ttk.Checkbutton(src_frame, text="SOC Agent Console & Queries", variable=self.ir_src_soc).grid(row=0, column=3, sticky="w", padx=10)
+        ttk.Checkbutton(src_frame, text="Extracted IOCs", variable=self.ir_src_iocs).grid(row=0, column=4, sticky="w", padx=10)
 
         self.ir_src_status = ttk.Label(src_frame, text="", foreground="gray")
-        self.ir_src_status.grid(row=1, column=0, columnspan=4, sticky="w", padx=10, pady=(5,0))
+        self.ir_src_status.grid(row=1, column=0, columnspan=5, sticky="w", padx=10, pady=(5,0))
 
         tpl_frame = ttk.LabelFrame(self.tab_incident, text="Report Template (Editable)", padding=10)
         tpl_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -2576,7 +2619,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
     def _gather_internal_data(self):
         """Collect all available internal data for the incident report."""
         sections = []
-        source_counts = {"flags": 0, "hints": 0, "bank": False, "soc_queries": 0, "soc_logs": 0}
+        source_counts = {"flags": 0, "hints": 0, "bank": False, "soc_queries": 0, "soc_logs": 0, "iocs": 0}
 
         # 1. Verified Flags & Answers
         if self.ir_src_flags.get() and self.verified_flags_data:
@@ -2585,6 +2628,8 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                 flags_text += f"  - {f.get('title', 'Unknown')}"
                 if f.get('note'):
                     flags_text += f" | Answer: {f['note']}"
+                if f.get('source'):
+                    flags_text += f" | Source: {f['source']}"
                 if f.get('focus_id') and f['focus_id'] != 'General/All':
                     flags_text += f" [{f['focus_id']}]"
                 flags_text += "\n"
@@ -2629,7 +2674,20 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                 except Exception:
                     pass
 
-        # 5. Deterministic timeline backbone extracted from real timestamps, so the
+        # 5. Extracted Indicators of Compromise (from the IOCs tab).
+        if self.ir_src_iocs.get() and self.ioc_results:
+            ioc_lines = ["EXTRACTED INDICATORS OF COMPROMISE (IOCs):"]
+            ioc_total = 0
+            for category in IOC_PATTERNS:  # stable ordering
+                vals = self.ioc_results.get(category, [])
+                if vals:
+                    ioc_lines.append(f"  {category}: " + ", ".join(vals[:50]))
+                    ioc_total += len(vals)
+            if ioc_total:
+                sections.append("\n".join(ioc_lines))
+                source_counts["iocs"] = ioc_total
+
+        # 6. Deterministic timeline backbone extracted from real timestamps, so the
         #    AI report is anchored to actual event order rather than a guess.
         timeline_events = []
         if self.ir_src_soc.get() and self.soc_last_records:
@@ -2674,6 +2732,8 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             source_parts.append(f"{counts['soc_queries']} SOC query/queries")
         if counts["soc_logs"]:
             source_parts.append(f"{counts['soc_logs']} log record(s)")
+        if counts["iocs"]:
+            source_parts.append(f"{counts['iocs']} IOC(s)")
 
         status_msg = "Sources: " + ", ".join(source_parts)
         self.ir_src_status.config(text=status_msg, foreground="blue")
@@ -3206,7 +3266,8 @@ FIRST LAUNCH
             "flag_bank": {
                 "text": self.flag_bank_text.get("1.0", "end"),
                 "model": self.flag_bank_model_var.get()
-            }
+            },
+            "iocs": self.ioc_results
         }
         f = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Session", "*.json")])
         if f:
@@ -3290,6 +3351,10 @@ FIRST LAUNCH
                 self.flag_bank_text.insert("1.0", bank_text)
                 self._flag_bank_cache = bank_text
                 self.flag_bank_model_var.set(data["flag_bank"].get("model", DEFAULT_MODEL))
+
+            if "iocs" in data and isinstance(data["iocs"], dict):
+                self.ioc_results = data["iocs"]
+                self._ioc_populate_tree(source="session")
 
             self.session_status.config(text=f"Loaded {os.path.basename(f)}", foreground="green")
             messagebox.showinfo("Session Loaded", "Full session state restored.")
