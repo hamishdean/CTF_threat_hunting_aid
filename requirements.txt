@@ -1,0 +1,26 @@
+# Unified SOC Analyst & Threat Hunter (CTF Edition) — Python dependencies
+#
+# Install everything with:
+#     pip install -r requirements.txt
+#
+# NOTE: The GUI also requires tkinter, which ships with Python but is packaged
+# separately on some systems:
+#     Debian/Ubuntu:    sudo apt-get install python3-tk
+#     Fedora/RHEL:      sudo dnf install python3-tkinter
+#     macOS (Homebrew): brew install python-tk
+
+# --- Core (needed for file-based threat hunting, reports, and OpenAI) ---
+openai>=1.0
+pypdf>=4.0
+pandas>=2.0
+colorama>=0.4
+python-docx>=1.0
+
+# --- Azure SOC Agent (live KQL execution against Log Analytics) ---
+azure-identity>=1.15
+azure-monitor-query>=1.2
+
+# --- Optional AI providers (install only if you use them) ---
+# The app runs fine without these; the matching provider is simply unavailable.
+anthropic>=0.40          # Claude
+google-generativeai>=0.8 # Gemini

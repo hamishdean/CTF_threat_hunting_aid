@@ -11,6 +11,8 @@ This tool bridges the gap between CTF flag hunting and real-world SOC investigat
 - **Natural-language to KQL translation** — describe what you're looking for and the AI generates valid Kusto queries targeting 30+ Azure Sentinel / Defender tables.
 - **Live Azure Log Analytics execution** — run generated (or hand-written) KQL directly against your workspace and get results in-app.
 - **File-based threat hunting** — load PDFs, DOCX, TXT, or JSONL log exports and let the AI scan them page-by-page for flags and IOCs.
+- **Deterministic IOC extraction & pivoting** — pull IPs, domains, URLs, hashes, emails, CVEs, and MITRE technique IDs from your files/findings (no API key needed, defang-aware), then pivot any indicator straight into a SOC Agent hunt or export to CSV/JSON.
+- **MITRE ATT&CK mapping** — incident reports and the Flag Bank narrative map observed activity to ATT&CK tactics/techniques.
 - **AI-assisted finding verification** — each candidate finding is presented for human review before being promoted to a verified flag.
 - **Flag Bank & narrative builder** — accumulate verified findings and let the AI synthesize them into a cohesive incident narrative.
 - **DOCX report generation** — export individual finding write-ups (with screenshots, KQL queries, and evidence) to a formatted Word document.
@@ -27,6 +29,7 @@ This tool bridges the gap between CTF flag hunting and real-world SOC investigat
 | 🧩 Flag Hints | Add CTF hints; AI suggests what to look for and generates starter KQL |
 | 🕵️ Threat Hunter | Load log files, run AI-driven page-by-page analysis, verify/discard findings |
 | 🛡️ Azure SOC Agent | Natural-language → KQL → execute → AI analysis pipeline against live Azure |
+| 🧬 IOCs | Extract indicators (IPs, domains, URLs, hashes, emails, CVEs, MITRE T-codes) from files/findings; pivot to SOC Agent; export CSV/JSON |
 | 🏦 Flag Bank | AI-generated narrative connecting all verified findings |
 | 🏆 Flag Summary | Overview of all verified flags |
 | 📝 Report Editor | Build per-finding entries with screenshots for Word export |
@@ -64,7 +67,11 @@ git clone https://gitlab.com/<your-namespace>/unifiedsoctool.git
 cd unifiedsoctool
 
 # Install dependencies
-pip install openai pypdf azure-identity azure-monitor-query pandas colorama python-docx
+pip install -r requirements.txt
+
+# (Linux only) tkinter is separate from pip on some distros:
+#   Debian/Ubuntu: sudo apt-get install python3-tk
+#   Fedora/RHEL:   sudo dnf install python3-tkinter
 
 # Run
 python unifiedsoctool.py
