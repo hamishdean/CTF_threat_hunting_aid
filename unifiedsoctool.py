@@ -8,30 +8,85 @@ import math
 import threading
 import re
 import datetime
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
-from tkinter import scrolledtext
 from datetime import timedelta
 from typing import List, Set
 
+# --- GUI toolkit (required to run the app, but guarded so the module can still be
+#     imported headlessly for testing / tooling on machines without tkinter) ---
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog, simpledialog
+    from tkinter import scrolledtext
+    HAS_TK = True
+except ImportError:
+    HAS_TK = False
+    tk = ttk = messagebox = filedialog = simpledialog = scrolledtext = None
+
 # --- Third Party Imports ---
+# Each library is imported independently so that one missing package degrades a
+# single feature with a clear message instead of crashing the whole program.
+_MISSING_LIBS = []
+
 try:
     from pypdf import PdfReader
+    HAS_PYPDF = True
+except ImportError:
+    HAS_PYPDF = False
+    PdfReader = None
+    _MISSING_LIBS.append("pypdf")
+
+try:
     import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+    pd = None
+    _MISSING_LIBS.append("pandas")
+
+try:
     from colorama import Fore, init, Style
+    HAS_COLORAMA = True
+except ImportError:
+    HAS_COLORAMA = False
+    _MISSING_LIBS.append("colorama")
+
+    # Fallback shims so the many Fore.<COLOR> references never raise.
+    class _NoColor:
+        def __getattr__(self, name):
+            return ""
+    Fore = Style = _NoColor()
+
+    def init(*args, **kwargs):
+        pass
+
+try:
     from openai import OpenAI
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+    OpenAI = None
+    _MISSING_LIBS.append("openai")
+
+try:
     from azure.identity import DefaultAzureCredential
     from azure.monitor.query import LogsQueryClient
     from azure.core.exceptions import HttpResponseError
+    HAS_AZURE = True
+except ImportError:
+    HAS_AZURE = False
+    DefaultAzureCredential = LogsQueryClient = HttpResponseError = None
+    _MISSING_LIBS.append("azure-identity + azure-monitor-query")
 
+try:
     # Imports for Report Generator & Docx Reading
     from docx import Document
     from docx.shared import Inches, Pt, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
-except ImportError as e:
-    print(f"Missing Library: {e}")
-    print("Please install: pip install openai pypdf azure-identity azure-monitor-query pandas colorama tiktoken python-docx")
-    print("Optional AI providers: pip install anthropic google-generativeai")
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+    Document = Inches = Pt = RGBColor = WD_ALIGN_PARAGRAPH = None
+    _MISSING_LIBS.append("python-docx")
 
 # Optional AI Provider imports
 HAS_ANTHROPIC = False
@@ -119,12 +174,18 @@ def extract_text_from_file(filepath: str) -> List[str]:
     try:
         ext = filepath.lower()
         if ext.endswith('.pdf'):
+            if not HAS_PYPDF:
+                print(f"Cannot read {os.path.basename(filepath)}: pypdf is not installed (pip install pypdf).")
+                return text_chunks
             reader = PdfReader(filepath)
             for page in reader.pages:
                 text = page.extract_text()
                 if text:
                     text_chunks.append(text)
         elif ext.endswith('.docx'):
+            if not HAS_DOCX:
+                print(f"Cannot read {os.path.basename(filepath)}: python-docx is not installed (pip install python-docx).")
+                return text_chunks
             doc = Document(filepath)
             full_text = []
             for para in doc.paragraphs:
@@ -140,6 +201,158 @@ def extract_text_from_file(filepath: str) -> List[str]:
     except Exception as e:
         print(f"Error reading {filepath}: {e}")
     return text_chunks
+
+# ------------------------------------------
+# IOC EXTRACTION (deterministic - no AI/Azure)
+# ------------------------------------------
+
+# Reports and logs frequently "defang" indicators so they aren't clickable.
+# Convert them back so the regexes below can match.
+_DEFANG_REPLACEMENTS = [
+    ("[.]", "."), ("(.)", "."), ("{.}", "."), ("[dot]", "."), ("(dot)", "."),
+    ("[:]", ":"), ("[//]", "//"), ("[/]", "/"), ("[@]", "@"), ("[at]", "@"),
+    ("hxxps", "https"), ("hxxp", "http"), ("hXXps", "https"), ("hXXp", "http"),
+]
+
+# TLD-looking tokens that are really file extensions; used to drop filename noise
+# (e.g. "report.pdf", "payload.exe") from the domain category.
+_COMMON_FILE_EXTS = {
+    "exe", "dll", "sys", "bat", "cmd", "ps1", "vbs", "js", "jse", "hta", "scr",
+    "txt", "log", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "rtf",
+    "png", "jpg", "jpeg", "gif", "bmp", "svg", "ico", "zip", "rar", "7z", "tar",
+    "gz", "csv", "json", "xml", "html", "htm", "php", "asp", "aspx", "py", "sh",
+    "bin", "dat", "tmp", "conf", "ini", "md", "yml", "yaml", "sql", "db", "lnk",
+}
+
+# Ordered so more specific / longer patterns are reported first.
+IOC_PATTERNS = {
+    "ipv4": r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b",
+    "ipv6": r"\b(?:[A-Fa-f0-9]{1,4}:){2,7}[A-Fa-f0-9]{1,4}\b",
+    "sha256": r"\b[A-Fa-f0-9]{64}\b",
+    "sha1": r"\b[A-Fa-f0-9]{40}\b",
+    "md5": r"\b[A-Fa-f0-9]{32}\b",
+    "url": r"\bhttps?://[^\s<>\"'\)\]]+",
+    "email": r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b",
+    "domain": r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}\b",
+    "cve": r"\bCVE-\d{4}-\d{4,7}\b",
+    "mitre": r"\bT\d{4}(?:\.\d{3})?\b",
+}
+
+def refang(text):
+    """Convert defanged IOCs (hxxp://, 1.2.3[.]4) back to normal form."""
+    if not text:
+        return ""
+    out = text
+    for a, b in _DEFANG_REPLACEMENTS:
+        out = out.replace(a, b)
+    return out
+
+def extract_iocs(text):
+    """Extract common indicators of compromise from raw text (deterministic).
+
+    Returns a dict of {category: sorted unique list} for any category that had
+    hits. Categories: ipv4, ipv6, domain, url, email, md5, sha1, sha256, cve,
+    mitre. Handles defanged indicators and filters obvious filename / timestamp
+    false positives.
+    """
+    if not text:
+        return {}
+    clean = refang(text)
+    results = {}
+
+    for category, pattern in IOC_PATTERNS.items():
+        flags = re.IGNORECASE if category in ("url", "email", "domain", "cve") else 0
+        matches = re.findall(pattern, clean, flags)
+
+        # Dedupe case-insensitively while preserving first-seen casing.
+        seen_lower = set()
+        unique = []
+        for m in matches:
+            key = m.lower()
+            if key not in seen_lower:
+                seen_lower.add(key)
+                unique.append(m)
+        if unique:
+            results[category] = unique
+
+    # ipv6: drop pure-decimal colon strings (timestamps like 10:30:45) - keep only
+    # matches that contain a hex letter or the "::" compression marker.
+    if "ipv6" in results:
+        kept = [v for v in results["ipv6"] if "::" in v or re.search(r"[A-Fa-f]", v)]
+        if kept:
+            results["ipv6"] = kept
+        else:
+            results.pop("ipv6")
+
+    # domain: drop filename noise (report.pdf, payload.exe). Domains that also
+    # appear inside a URL or email are kept on purpose - the bare host is a
+    # distinct, pivotable indicator for hunting.
+    if "domain" in results:
+        kept = [d for d in results["domain"]
+                if d.rsplit(".", 1)[-1].lower() not in _COMMON_FILE_EXTS]
+        if kept:
+            results["domain"] = kept
+        else:
+            results.pop("domain")
+
+    return {k: sorted(v) for k, v in results.items()}
+
+# ------------------------------------------
+# TIMELINE BUILDER (deterministic - no AI)
+# ------------------------------------------
+
+# Common timestamp field names in Azure/Sentinel records and finding dicts.
+_TIMESTAMP_KEYS = ("TimeGenerated", "timestamp", "Timestamp", "time", "Time",
+                   "createdDateTime", "eventTime", "StartTime", "EndTime", "Date")
+
+# ISO-8601-ish timestamp anywhere in a stringified value (fallback).
+_TIMESTAMP_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?\b")
+
+# Fields that make a good one-line description for a timeline row, best first.
+_TIMELINE_DESC_KEYS = ("title", "AlertName", "description", "Description", "message",
+                       "flag_answer", "FlagAnswer", "ProcessCommandLine", "AccountName",
+                       "DeviceName", "RemoteIP", "note")
+
+def build_timeline(events, max_events=100):
+    """Build a chronological timeline from records/findings (deterministic).
+
+    `events` is an iterable of dicts (Azure log records, finding dicts, etc.).
+    For each dict, use the first recognizable timestamp field (or any ISO-8601-ish
+    timestamp found in its values) plus a short description. Returns a list of
+    (timestamp_string, description) tuples sorted ascending; rows with no
+    parseable timestamp are skipped. Gives the AI report a factual backbone
+    instead of relying on it to invent the order.
+    """
+    rows = []
+    for ev in events or []:
+        if not isinstance(ev, dict):
+            continue
+
+        ts = None
+        for key in _TIMESTAMP_KEYS:
+            if ev.get(key):
+                ts = str(ev[key])
+                break
+        if not ts:
+            match = _TIMESTAMP_RE.search(" ".join(str(v) for v in ev.values()))
+            if match:
+                ts = match.group(0)
+        if not ts:
+            continue
+
+        desc = ""
+        for key in _TIMELINE_DESC_KEYS:
+            if ev.get(key):
+                desc = str(ev[key])
+                break
+        if not desc:
+            desc = "; ".join(f"{k}={v}" for k, v in list(ev.items())[:4])
+
+        rows.append((ts.strip(), desc.strip()[:200]))
+
+    # ISO-8601 strings sort chronologically as plain text.
+    rows.sort(key=lambda r: r[0])
+    return rows[:max_events]
 
 # ==========================================
 # 2. PROMPTS & AI UTILS
@@ -291,8 +504,9 @@ Your task:
 2. Include the EXACT flag answers/artifacts in the report (do not paraphrase them).
 3. Reference the KQL queries and evidence used to find each answer.
 4. Build a chronological timeline from timestamps in the data.
-5. Fill in the report template provided by the analyst.
-6. If data is missing for a template section, note it as "Not enough data available".
+5. Map the activity to MITRE ATT&CK tactics and techniques (with technique IDs) where the evidence supports it.
+6. Fill in the report template provided by the analyst.
+7. If data is missing for a template section, note it as "Not enough data available".
 """
 
 def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_tokens=4096, temperature=None):
@@ -311,19 +525,24 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
         Response content as a string
     """
     if provider == "OpenAI":
+        if not HAS_OPENAI:
+            raise ImportError("openai package not installed. Run: pip install openai")
         client = OpenAI(api_key=api_key)
         kwargs = {"model": model, "messages": messages}
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        # Newer OpenAI reasoning models (o-series, gpt-5) require
+        # max_completion_tokens and only accept the default temperature.
+        needs_completion_tokens = model.startswith(("o1", "o3", "o4", "gpt-5"))
         if max_tokens:
-            # Newer OpenAI models (o-series, gpt-5) require max_completion_tokens
-            needs_completion_tokens = model.startswith(("o1", "o3", "o4", "gpt-5"))
             token_param = "max_completion_tokens" if needs_completion_tokens else "max_tokens"
             kwargs[token_param] = max_tokens
-        if temperature is not None:
+        if temperature is not None and not needs_completion_tokens:
             kwargs["temperature"] = temperature
         response = client.chat.completions.create(**kwargs)
-        return response.choices[0].message.content
+        # content is None when a reasoning model hits the token cap before
+        # emitting text; return "" so callers/parse_ai_json fail cleanly.
+        return response.choices[0].message.content or ""
 
     elif provider == "Claude":
         if not HAS_ANTHROPIC:
@@ -351,7 +570,11 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
         if temperature is not None:
             kwargs["temperature"] = temperature
         response = client.messages.create(**kwargs)
-        return response.content[0].text
+        # Return the first text block; guard against empty or non-text content.
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                return block.text
+        return ""
 
     elif provider == "Gemini":
         if not HAS_GEMINI:
@@ -380,7 +603,16 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
             contents[0]["parts"][0] = system_text.strip() + "\n\n" + first_content
         model_obj = genai.GenerativeModel(model, generation_config=gen_config if gen_config else None)
         response = model_obj.generate_content(contents)
-        return response.text
+        # response.text raises when the model returned no text part (blocked or
+        # empty); fall back to assembling text from the candidate parts.
+        try:
+            return response.text
+        except Exception:
+            try:
+                parts = response.candidates[0].content.parts
+                return "".join(getattr(p, "text", "") for p in parts)
+            except Exception:
+                return ""
 
     else:
         raise ValueError(f"Unsupported AI provider: {provider}")
@@ -412,6 +644,33 @@ def clean_json_string(json_str):
     if start != -1 and end != -1 and end > start:
         return json_str[start : end + 1]
     return json_str.replace("```json", "").replace("```", "").strip()
+
+def parse_ai_json(content):
+    """Robustly parse a JSON object from raw AI output.
+
+    Handles None, markdown ```json code fences, and leading/trailing prose that
+    some providers (notably Claude and Gemini) wrap around the JSON even when a
+    JSON response was requested. Raises ValueError with a short snippet if no
+    valid JSON object can be recovered, so callers can surface a clear message
+    instead of silently dropping results (the historic bug where every finding
+    vanished on non-OpenAI providers).
+    """
+    if content is None:
+        raise ValueError("AI returned an empty response (no content).")
+
+    # First attempt: extract the outermost {...} block (strips fences + prose).
+    try:
+        return json.loads(clean_json_string(content))
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Second attempt: strip code fences explicitly and parse the whole string.
+    stripped = content.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, TypeError):
+        snippet = " ".join(content.split())[:200]
+        raise ValueError(f"AI did not return valid JSON. Response was: {snippet}")
 
 def get_query_context(provider, api_key, user_input, model, history=None, hints=None, active_focus="General/All", incident_context=""):
     # Keep context concise to avoid confusing the KQL generator
@@ -445,8 +704,7 @@ def get_query_context(provider, api_key, user_input, model, history=None, hints=
     ]
     try:
         content = ai_chat_completion(provider, api_key, model, messages, json_mode=True)
-        content = clean_json_string(content)
-        query_context = json.loads(content)
+        query_context = parse_ai_json(content)
 
         # UPDATED: Clean parameters like EXECUTOR.py
         if "kql_query" not in query_context:
@@ -508,6 +766,11 @@ def hunt_on_records(provider, api_key, records, table_name, model, hints=None, f
     except Exception:
         csv_data = str(records)
 
+    # Bound payload size to keep token cost/latency sane (matches the file-hunter cap).
+    MAX_CSV_CHARS = 15000
+    if len(csv_data) > MAX_CSV_CHARS:
+        csv_data = csv_data[:MAX_CSV_CHARS] + "\n... (truncated for length)"
+
     context_str = ""
     if hints:
         context_str += f"CTF HINTS (FOCUS: {active_focus}):\n" + "\n".join([f"- [{h.get('id', 'General')}] {h['hint']}" for h in hints]) + "\n"
@@ -526,8 +789,7 @@ LOG DATA:
     try:
         messages = [SYSTEM_PROMPT_THREAT_HUNT, {"role": "user", "content": prompt}]
         content = ai_chat_completion(provider, api_key, model, messages, json_mode=True)
-        content = clean_json_string(content)
-        return json.loads(content).get("findings", [])
+        return parse_ai_json(content).get("findings", [])
     except Exception as e:
         raise e
 
@@ -741,6 +1003,13 @@ class ThreatHuntReporterTab:
 
     def generate_report(self):
         if not self.entries: return
+        if not HAS_DOCX:
+            messagebox.showerror(
+                "Missing Library",
+                "Generating a Word report needs python-docx, which is not installed.\n\n"
+                "pip install python-docx"
+            )
+            return
         f = filedialog.asksaveasfilename(defaultextension=".docx")
         if not f: return
         try:
@@ -845,6 +1114,13 @@ class UnifiedSOCTool:
         self._ai_cancel_event = threading.Event()
         self._ai_running = False
         self._flag_bank_cache = ""
+        self.flag_bank_model_var = tk.StringVar(value=DEFAULT_MODEL)
+        # Opt-in: regenerate the Incident Report + Flag Bank narrative every time a
+        # flag is verified. Off by default so a normal hunt doesn't fire a storm of
+        # slow, costly LLM calls (and overwrite manual report edits).
+        self.auto_update_var = tk.BooleanVar(value=False)
+
+        self.ioc_results = {}  # category -> list of indicators (from IOC tab)
 
         self.ctf_hints = []
         self.hint_model_var = tk.StringVar(value=DEFAULT_MODEL)
@@ -892,6 +1168,7 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self.tab_hints = ttk.Frame(self.notebook)
         self.tab_hunter = ttk.Frame(self.notebook)
         self.tab_soc = ttk.Frame(self.notebook)
+        self.tab_iocs = ttk.Frame(self.notebook) # NEW IOC EXTRACTOR
         self.tab_flag_bank = ttk.Frame(self.notebook) # NEW FLAG BANK
         self.tab_summary = ttk.Frame(self.notebook)
         self.tab_report = ttk.Frame(self.notebook)
@@ -903,6 +1180,7 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self.notebook.add(self.tab_hints, text="🧩 Flag Hints")
         self.notebook.add(self.tab_hunter, text="🕵️ Threat Hunter")
         self.notebook.add(self.tab_soc, text="🛡️ Azure SOC Agent")
+        self.notebook.add(self.tab_iocs, text="🧬 IOCs") # NEW
         self.notebook.add(self.tab_flag_bank, text="🏦 Flag Bank (Context)") # NEW
         self.notebook.add(self.tab_summary, text="🏆 Flag Summary")
         self.notebook.add(self.tab_report, text="📝 Report Editor")
@@ -914,6 +1192,7 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self._setup_hints_tab()
         self._setup_hunter_tab()
         self._setup_soc_tab()
+        self._setup_iocs_tab() # NEW
         self._setup_flag_bank_tab() # NEW
         self._setup_summary_tab()
         self._setup_incident_tab()
@@ -1122,12 +1401,13 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
                 self._get_provider(), self._get_api_key(), model,
                 [{"role": "user", "content": prompt}], json_mode=True
             )
-            data = json.loads(content)
+            data = parse_ai_json(content)
             entry = {"id": flag_id, "hint": hint_text, "clue": data.get("clue"), "kql": data.get("kql")}
             self.ctf_hints.append(entry)
             self.root.after(0, lambda: self._update_hint_ui(entry))
         except Exception as e:
-            print(f"Hint Error: {e}")
+            err = f"\n[!] Hint analysis failed: {e}\n" + "-" * 50 + "\n"
+            self.root.after(0, lambda: self._append_hint_display(err))
 
     def _update_hint_ui(self, entry):
         msg = f"\n✅ HINT ADDED ({entry['id']}):\nHint: {entry['hint']}\nAI Clue: {entry['clue']}\nSuggested KQL: {entry['kql']}\n" + "-"*50 + "\n"
@@ -1137,6 +1417,13 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self.hint_display.config(state="disabled")
         self.hint_input.delete("1.0", "end")
         messagebox.showinfo("Success", "Hint added to AI Memory.")
+
+    def _append_hint_display(self, msg):
+        """Append a message to the hints panel (thread-safe when called via root.after)."""
+        self.hint_display.config(state="normal")
+        self.hint_display.insert("end", msg)
+        self.hint_display.see("end")
+        self.hint_display.config(state="disabled")
 
     # -------------------------------------------------------------------------
     # HELPER: GET ACTIVE HINTS & CONTEXT
@@ -1176,6 +1463,12 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill="x", pady=5)
 
+        ttk.Label(btn_frame, text="Model:").pack(side="left")
+        flag_bank_model_combo = ttk.Combobox(btn_frame, textvariable=self.flag_bank_model_var,
+                                              values=self._get_models_for_provider(), state="readonly", width=25)
+        flag_bank_model_combo.pack(side="left", padx=5)
+        self._model_combos.append((self.flag_bank_model_var, flag_bank_model_combo))
+
         ttk.Button(btn_frame, text="🔄 Update Understanding with AI", command=self.update_flag_bank_ai).pack(side="right")
         ttk.Button(btn_frame, text="📤 Export Narrative to Incident Report", command=self.export_flag_bank_to_ir).pack(side="right", padx=10)
 
@@ -1188,13 +1481,14 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         # Get data on main thread
         flags_data = list(self.verified_flags_data)
         hints_data = list(self.ctf_hints)
+        model = self.flag_bank_model_var.get()
 
         self.flag_bank_text.insert("end", "\n[System] Updating narrative...\n")
         self.flag_bank_text.see("end")
 
-        threading.Thread(target=self._flag_bank_ai_thread, args=(flags_data, hints_data), daemon=True).start()
+        threading.Thread(target=self._flag_bank_ai_thread, args=(flags_data, hints_data, model), daemon=True).start()
 
-    def _flag_bank_ai_thread(self, flags, hints):
+    def _flag_bank_ai_thread(self, flags, hints, model):
         try:
             context_str = "VERIFIED FACTS:\n" + "\n".join([f"- {f['title']}: {f['note']}" for f in flags])
             context_str += "\n\nKNOWN HINTS:\n" + "\n".join([f"- {h['hint']}" for h in hints])
@@ -1205,23 +1499,28 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
 
             - Connect the dots between flags.
             - Highlight what is confirmed vs what is suspected (hints).
+            - Map the activity to MITRE ATT&CK tactics and techniques (include technique
+              IDs such as T1059) wherever the evidence supports it.
             - Keep it professional and chronological if possible.
 
             DATA:
             {context_str}
             """
 
-            provider = self._get_provider()
-            model = PROVIDER_DEFAULTS.get(provider, DEFAULT_MODEL)
             narrative = ai_chat_completion(
-                provider, self._get_api_key(), model,
+                self._get_provider(), self._get_api_key(), model,
                 [{"role": "user", "content": prompt}]
             )
 
             self.root.after(0, lambda: self._update_flag_bank_ui(narrative))
 
         except Exception as e:
-            print(f"Bank AI Error: {e}")
+            self.root.after(0, lambda e=e: self._flag_bank_text_append(f"\n[!] Narrative update failed: {e}\n"))
+
+    def _flag_bank_text_append(self, msg):
+        """Append a message to the Flag Bank panel without wiping existing narrative."""
+        self.flag_bank_text.insert("end", msg)
+        self.flag_bank_text.see("end")
 
     def _update_flag_bank_ui(self, text):
         self.flag_bank_text.delete("1.0", "end")
@@ -1288,6 +1587,11 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
 
         self.th_status_lbl = ttk.Label(action_frame, text="Status: Idle", foreground="blue")
         self.th_status_lbl.pack(side="right", padx=10)
+
+        # Off by default: verifying a flag stays fast/free. Turn on to regenerate the
+        # Incident Report + Flag Bank narrative automatically after each verify.
+        ttk.Checkbutton(action_frame, text="Auto-refresh reports on verify (extra API calls)",
+                        variable=self.auto_update_var).pack(side="right", padx=10)
 
         bot_frame = ttk.LabelFrame(self.tab_hunter, text="Verified Flags History", padding=10)
         bot_frame.pack(fill="x", padx=10, pady=5)
@@ -1379,13 +1683,14 @@ LOGS:
                     self._get_provider(), self._get_api_key(), model,
                     [{"role": "user", "content": prompt}], json_mode=True
                 )
-                data = json.loads(content)
+                data = parse_ai_json(content)
                 findings = data.get("findings", [])
                 for f in findings:
                     if f.get("title") not in self.th_found_flags:
                         self.th_candidate_queue.append(f)
             except Exception as e:
-                print(f"AI Error: {e}")
+                err = f"[!] Analysis error on batch (pages {self.th_current_idx}): {e}"
+                self.root.after(0, lambda m=err: self.th_log_history(m))
         self._set_ai_running(False)
         self.root.after(0, lambda: messagebox.showinfo("Done", "Hunt Complete."))
 
@@ -1425,7 +1730,7 @@ LOGS:
         try:
             content = self.th_editor.get("1.0", "end").strip()
             if not content: return
-            data = json.loads(content)
+            data = parse_ai_json(content)
             title = data.get("AlertName", data.get("title", "Unknown"))
             description = data.get("Description", "")
             flag_answer = data.get("FlagAnswer", data.get("flag_answer", ""))
@@ -1506,9 +1811,13 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             })
             self._update_summary_display()
 
-            # --- AUTO TRIGGER INCIDENT REPORT & FLAG BANK ---
-            self.root.after(500, self.auto_generate_incident_report)
-            self.root.after(1000, self.update_flag_bank_ai) # Trigger Bank update
+            # --- OPTIONAL AUTO-REFRESH (off by default) ---
+            # Regenerating the full Incident Report and Flag Bank narrative on every
+            # single verify is slow and expensive, and clobbers manual report edits.
+            # Only do it when the analyst explicitly opts in via the checkbox.
+            if self.auto_update_var.get():
+                self.root.after(500, self.auto_generate_incident_report)
+                self.root.after(1000, self.update_flag_bank_ai)
             # ------------------------------------
 
             self.th_editor.delete("1.0", "end")
@@ -1556,6 +1865,13 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         ttk.Button(btn_box, text="🩹 Self-Heal Last KQL", command=self.soc_self_heal).pack(side="right", padx=2)
 
     def _soc_precheck(self):
+        if not HAS_AZURE:
+            messagebox.showerror(
+                "Missing Library",
+                "The SOC Agent needs the Azure libraries, which are not installed.\n\n"
+                "pip install azure-identity azure-monitor-query"
+            )
+            return False
         if not self._get_api_key() or not self.workspace_id_var.get():
             messagebox.showerror("Config Error", "Please set API Key and Workspace ID in Configuration Tab.")
             return False
@@ -1895,7 +2211,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                 self._get_provider(), self._get_api_key(), self.soc_model_var.get(),
                 [{"role": "user", "content": prompt}], json_mode=True
             )
-            data = json.loads(content)
+            data = parse_ai_json(content)
             fixed_kql = data.get("fixed_kql", "")
             explanation = data.get("explanation", "")
 
@@ -1947,6 +2263,157 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                     self.notebook.select(self.tab_hunter)
             else:
                 messagebox.showerror("Error", "Failed to save file.")
+
+    # -------------------------------------------------------------------------
+    # IOC EXTRACTOR (NEW)
+    # -------------------------------------------------------------------------
+    def _setup_iocs_tab(self):
+        top = ttk.LabelFrame(self.tab_iocs, text="Indicator of Compromise (IOC) Extractor", padding=10)
+        top.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(top, text="Pull IOCs (IPs, domains, URLs, hashes, emails, CVEs, MITRE T-codes) "
+                            "from your data. Deterministic — no API key or Azure needed.",
+                  font=("Segoe UI", 9, "italic")).pack(anchor="w", pady=(0, 8))
+
+        btn_row = ttk.Frame(top)
+        btn_row.pack(fill="x")
+        ttk.Button(btn_row, text="📄 Extract from Loaded Files", command=self.ioc_extract_from_files).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="🏁 Extract from Findings & Logs", command=self.ioc_extract_from_findings).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="🧹 Clear", command=self.ioc_clear).pack(side="left", padx=2)
+        self.ioc_count_lbl = ttk.Label(btn_row, text="0 indicators", foreground="gray")
+        self.ioc_count_lbl.pack(side="right", padx=5)
+
+        mid = ttk.LabelFrame(self.tab_iocs, text="Extracted Indicators", padding=10)
+        mid.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.ioc_tree = ttk.Treeview(mid, columns=("type", "indicator"), show="headings", selectmode="extended")
+        self.ioc_tree.heading("type", text="Type")
+        self.ioc_tree.heading("indicator", text="Indicator")
+        self.ioc_tree.column("type", width=120, stretch=False)
+        self.ioc_tree.column("indicator", width=760)
+        ioc_scroll = ttk.Scrollbar(mid, orient="vertical", command=self.ioc_tree.yview)
+        self.ioc_tree.configure(yscrollcommand=ioc_scroll.set)
+        self.ioc_tree.pack(side="left", fill="both", expand=True)
+        ioc_scroll.pack(side="right", fill="y")
+
+        bot = ttk.Frame(self.tab_iocs)
+        bot.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(bot, text="🎯 Pivot Selected → SOC Agent", command=self.ioc_pivot_to_soc).pack(side="left", padx=2)
+        ttk.Button(bot, text="📋 Copy Selected", command=self.ioc_copy_selected).pack(side="left", padx=2)
+        ttk.Button(bot, text="💾 Export JSON", command=lambda: self.ioc_export("json")).pack(side="right", padx=2)
+        ttk.Button(bot, text="💾 Export CSV", command=lambda: self.ioc_export("csv")).pack(side="right", padx=2)
+
+    def _ioc_gather_files_text(self):
+        """Read all loaded Threat Hunter files into one text blob."""
+        blobs = []
+        for f in self.th_files:
+            if os.path.exists(f):
+                blobs.extend(extract_text_from_file(f))
+        return "\n".join(blobs)
+
+    def _ioc_gather_findings_text(self):
+        """Collect text from verified findings, hints, and the latest SOC records."""
+        parts = []
+        for f in self.verified_flags_data:
+            parts.extend([f.get("title", ""), f.get("description", ""), f.get("note", "")])
+        for h in self.ctf_hints:
+            parts.extend([h.get("hint", ""), h.get("clue", "") or "", h.get("kql", "") or ""])
+        if self.soc_last_records:
+            try:
+                parts.append(json.dumps(self.soc_last_records, default=str))
+            except Exception:
+                parts.append(str(self.soc_last_records))
+        return "\n".join(p for p in parts if p)
+
+    def ioc_extract_from_files(self):
+        if not self.th_files:
+            messagebox.showinfo("No Files", "Add files in the Threat Hunter tab first.")
+            return
+        text = self._ioc_gather_files_text()
+        if not text.strip():
+            messagebox.showinfo("No Text", "No readable text found in the loaded files.")
+            return
+        self._ioc_set_results(extract_iocs(text), source="loaded files")
+
+    def ioc_extract_from_findings(self):
+        text = self._ioc_gather_findings_text()
+        if not text.strip():
+            messagebox.showinfo("No Data", "No findings, hints, or SOC results available yet.")
+            return
+        self._ioc_set_results(extract_iocs(text), source="findings & logs")
+
+    def _ioc_set_results(self, results, source=""):
+        self.ioc_results = results
+        for item in self.ioc_tree.get_children():
+            self.ioc_tree.delete(item)
+        total = 0
+        for category in IOC_PATTERNS:  # stable, sensible ordering
+            for value in results.get(category, []):
+                self.ioc_tree.insert("", "end", values=(category, value))
+                total += 1
+        suffix = f" (from {source})" if source else ""
+        self.ioc_count_lbl.config(text=f"{total} indicators{suffix}",
+                                  foreground="black" if total else "gray")
+        if total == 0:
+            messagebox.showinfo("No IOCs", "No indicators of compromise were found in that data.")
+
+    def ioc_clear(self):
+        self.ioc_results = {}
+        for item in self.ioc_tree.get_children():
+            self.ioc_tree.delete(item)
+        self.ioc_count_lbl.config(text="0 indicators", foreground="gray")
+
+    def _ioc_selected_values(self):
+        return [self.ioc_tree.item(i, "values")[1] for i in self.ioc_tree.selection()]
+
+    def ioc_pivot_to_soc(self):
+        selected = self._ioc_selected_values()
+        if not selected:
+            messagebox.showinfo("No Selection", "Select one or more indicators to pivot on.")
+            return
+        joined = ", ".join(selected[:10])
+        query = (f"Search all tables for any activity involving these indicators: {joined}. "
+                 f"Return matching records with timestamps, devices, and accounts.")
+        self.soc_prompt_text.delete("1.0", "end")
+        self.soc_prompt_text.insert("1.0", query)
+        self.notebook.select(self.tab_soc)
+
+    def ioc_copy_selected(self):
+        selected = self._ioc_selected_values()
+        if not selected:
+            messagebox.showinfo("No Selection", "Select one or more indicators to copy.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(selected))
+
+    def ioc_export(self, fmt):
+        if not self.ioc_results:
+            messagebox.showinfo("Nothing to Export", "Extract some IOCs first.")
+            return
+        if fmt == "json":
+            f = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+            if not f:
+                return
+            try:
+                with open(f, "w", encoding="utf-8") as fh:
+                    json.dump(self.ioc_results, fh, indent=2)
+                messagebox.showinfo("Exported", f"IOCs saved to {os.path.basename(f)}")
+            except Exception as e:
+                messagebox.showerror("Export Error", str(e))
+        else:
+            f = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+            if not f:
+                return
+            try:
+                with open(f, "w", encoding="utf-8", newline="") as fh:
+                    fh.write("type,indicator\n")
+                    for category in IOC_PATTERNS:
+                        for value in self.ioc_results.get(category, []):
+                            safe = '"' + str(value).replace('"', '""') + '"'
+                            fh.write(f"{category},{safe}\n")
+                messagebox.showinfo("Exported", f"IOCs saved to {os.path.basename(f)}")
+            except Exception as e:
+                messagebox.showerror("Export Error", str(e))
 
     # -------------------------------------------------------------------------
     # SUMMARY TAB (NEW)
@@ -2091,6 +2558,19 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                 except Exception:
                     pass
 
+        # 5. Deterministic timeline backbone extracted from real timestamps, so the
+        #    AI report is anchored to actual event order rather than a guess.
+        timeline_events = []
+        if self.ir_src_soc.get() and self.soc_last_records:
+            timeline_events.extend(self.soc_last_records)
+        if self.ir_src_flags.get() and self.verified_flags_data:
+            timeline_events.extend(self.verified_flags_data)
+        timeline = build_timeline(timeline_events)
+        if timeline:
+            tl_text = "DETERMINISTIC TIMELINE (from data timestamps, ascending):\n"
+            tl_text += "\n".join(f"  {ts}  |  {desc}" for ts, desc in timeline)
+            sections.append(tl_text)
+
         return "\n\n".join(sections), source_counts
 
     def ir_generate(self):
@@ -2191,10 +2671,16 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
 
 TASK 1: TIMELINE OF EVENTS
   - Create a chronological timeline (YYYY-MM-DD HH:MM:SS UTC format).
-  - Use timestamps from logs, alerts, and findings.
+  - Use timestamps from logs, alerts, and findings. A DETERMINISTIC TIMELINE
+    block (already sorted) may be provided below — build on it, don't contradict it.
   - If exact timestamps are unavailable, note the sequence of events.
 
-TASK 2: INVESTIGATION REPORT
+TASK 2: MITRE ATT&CK MAPPING
+  - Map the observed activity to MITRE ATT&CK tactics and techniques.
+  - Format each as: Tactic - Technique Name (Txxxx[.xxx]) - one line of supporting evidence.
+  - Only include techniques the evidence actually supports.
+
+TASK 3: INVESTIGATION REPORT
   - Fill in the template below using ALL available data.
   - Include the specific flag answers/artifacts found.
   - Reference the evidence and KQL queries used.
@@ -2269,6 +2755,7 @@ TABLE OF CONTENTS
      2b. Flag Hints
      2c. Threat Hunter
      2d. Azure SOC Agent
+     2d.1 IOC Extractor
      2e. Flag Bank (Context)
      2f. Flag Summary
      2g. Report Editor
@@ -2361,7 +2848,12 @@ FIRST LAUNCH
   5. When a finding is discovered, it appears in the "Potential Flag" editor:
      - Click "Verify & Save" to confirm and save the finding.
      - Click "Discard" to skip it.
-  6. Verified findings go to Flag Summary and trigger report updates.
+  6. Verified findings are added to the Flag Summary instantly.
+
+  AUTO-REFRESH: By default, verifying a flag does NOT regenerate the Incident
+  Report or Flag Bank narrative (those cost API calls and overwrite manual
+  edits). Tick "Auto-refresh reports on verify" in the action row if you want
+  that automatically; otherwise refresh them on demand from their own tabs.
 
   MANUAL FLAG: Click "Manually Add Flag" to enter a finding by hand
   (useful if you spot something the AI missed).
@@ -2412,6 +2904,23 @@ FIRST LAUNCH
   - Syslog                  - CommonSecurityLog
   - ThreatIntelligenceIndicator  - BehaviorAnalytics
   - ...and any other table in your workspace
+
+
+--------------------------------------------------------------------------------
+2d.1 IOC EXTRACTOR TAB
+--------------------------------------------------------------------------------
+  PURPOSE: Pull indicators of compromise out of your data with no AI/API calls.
+  Extracts IPv4/IPv6, domains, URLs, emails, MD5/SHA1/SHA256 hashes, CVEs, and
+  MITRE ATT&CK technique IDs. Understands defanged IOCs (hxxp://, 1.2.3[.]4).
+
+  HOW TO USE:
+  1. Load files in the Threat Hunter tab (or accumulate findings / SOC results).
+  2. Click "Extract from Loaded Files" or "Extract from Findings & Logs".
+  3. Review the categorized indicators in the table.
+  4. Select one or more indicators, then:
+     - "Pivot Selected -> SOC Agent" prefills a hunt query for those IOCs.
+     - "Copy Selected" copies them to the clipboard.
+  5. "Export CSV" / "Export JSON" saves the full IOC set for reporting.
 
 
 --------------------------------------------------------------------------------
@@ -2614,7 +3123,8 @@ FIRST LAUNCH
                 "output": self.ir_output_text.get("1.0", "end")
             },
             "flag_bank": {
-                "text": self.flag_bank_text.get("1.0", "end")
+                "text": self.flag_bank_text.get("1.0", "end"),
+                "model": self.flag_bank_model_var.get()
             }
         }
         f = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Session", "*.json")])
@@ -2693,6 +3203,7 @@ FIRST LAUNCH
                 self.flag_bank_text.delete("1.0", "end")
                 self.flag_bank_text.insert("1.0", bank_text)
                 self._flag_bank_cache = bank_text
+                self.flag_bank_model_var.set(data["flag_bank"].get("model", DEFAULT_MODEL))
 
             self.session_status.config(text=f"Loaded {os.path.basename(f)}", foreground="green")
             messagebox.showinfo("Session Loaded", "Full session state restored.")
@@ -2700,6 +3211,21 @@ FIRST LAUNCH
             messagebox.showerror("Load Error", str(e))
 
 if __name__ == "__main__":
+    if not HAS_TK:
+        print("ERROR: tkinter is required to run this GUI application but is not installed.")
+        print("  Debian/Ubuntu:      sudo apt-get install python3-tk")
+        print("  Fedora/RHEL:        sudo dnf install python3-tkinter")
+        print("  macOS (Homebrew):   brew install python-tk")
+        print("  Windows:            reinstall Python with the 'tcl/tk' option checked")
+        sys.exit(1)
+
+    if _MISSING_LIBS:
+        print("WARNING: the following optional libraries are not installed, so some")
+        print("features will be unavailable until you install them:")
+        print("  " + ", ".join(_MISSING_LIBS))
+        print("  Install everything with:  pip install -r requirements.txt")
+        print("-" * 60)
+
     init(autoreset=True)
     root = tk.Tk()
     app = UnifiedSOCTool(root)
