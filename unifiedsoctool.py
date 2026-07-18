@@ -127,6 +127,10 @@ PROVIDER_ENV_KEYS = {
     "Claude": "ANTHROPIC_API_KEY",
 }
 
+# Folder for auto-captured SOC query results. Absolute so the paths added to the
+# Threat Hunter keep working even if the process's working directory changes.
+CAPTURE_DIR = os.path.abspath("soc_captured_logs")
+
 class SessionLogger:
     """Redirects print statements to a tkinter ScrolledText widget."""
     def __init__(self, text_widget):
@@ -1104,6 +1108,8 @@ class UnifiedSOCTool:
         self.th_pages_buffer = []
         self.th_current_idx = 0
         self.th_model_var = tk.StringVar(value=DEFAULT_MODEL)
+        self._th_complete_logged = False   # de-dupe the "Hunt complete" notice
+        self._th_verifying = False          # guard re-entrant Verify while drafting a note
 
         self.soc_memory = []
         self.soc_last_records = []
@@ -1121,6 +1127,10 @@ class UnifiedSOCTool:
         self.auto_update_var = tk.BooleanVar(value=False)
 
         self.ioc_results = {}  # category -> list of indicators (from IOC tab)
+
+        # Off by default: don't write API keys into saved session files (they are
+        # plaintext JSON). The analyst can opt in from the Session Manager tab.
+        self.save_keys_var = tk.BooleanVar(value=False)
 
         self.ctf_hints = []
         self.hint_model_var = tk.StringVar(value=DEFAULT_MODEL)
@@ -1623,38 +1633,60 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
             messagebox.showerror("Error", "Missing API Key in Configuration tab.")
             return
 
-        self.th_pages_buffer = []
-        for f in self.th_files:
-            self.th_status_lbl.config(text=f"Reading {os.path.basename(f)}...")
-            self.root.update()
-            pages = extract_text_from_file(f)
-            self.th_pages_buffer.extend(pages)
-
-        if not self.th_pages_buffer:
-            messagebox.showerror("Error", "No text could be extracted.")
-            return
-
         self.th_current_idx = 0
         self.th_candidate_queue = []
-        self.th_status_lbl.config(text=f"Processing {len(self.th_pages_buffer)} pages/chunks...")
+        self.th_pages_buffer = []
+        self._th_complete_logged = False
         self._ai_cancel_event.clear()
         self._set_ai_running(True)
-        threading.Thread(target=self.th_process_batch_thread, daemon=True).start()
+        self.th_status_lbl.config(text="Reading files...")
+        # Read files off the UI thread so large PDFs don't freeze the app.
+        threading.Thread(target=self._th_read_then_hunt, daemon=True).start()
+
+    def _th_read_then_hunt(self):
+        for f in self.th_files:
+            if self._ai_cancelled():
+                self.root.after(0, lambda: self.th_status_lbl.config(text="Hunt stopped by user."))
+                self._set_ai_running(False)
+                return
+            self.root.after(0, lambda n=os.path.basename(f): self.th_status_lbl.config(text=f"Reading {n}..."))
+            self.th_pages_buffer.extend(extract_text_from_file(f))
+
+        if not self.th_pages_buffer:
+            self.root.after(0, lambda: messagebox.showerror("Error", "No text could be extracted."))
+            self.root.after(0, lambda: self.th_status_lbl.config(text="Status: Idle"))
+            self._set_ai_running(False)
+            return
+
+        self.root.after(0, lambda: self.th_status_lbl.config(
+            text=f"Processing {len(self.th_pages_buffer)} pages/chunks..."))
+        # Continue processing in this same worker thread.
+        self.th_process_batch_thread()
 
     def th_process_batch_thread(self):
+        PAGE_CAP = 4          # never send more than this many pages at once
+        CHAR_BUDGET = 12000   # ...or more than roughly this many characters
+        HARD_CAP = 20000      # absolute ceiling for a single oversized page
+
         while self.th_current_idx < len(self.th_pages_buffer):
             if self._ai_cancelled():
                 self.root.after(0, lambda: self.th_status_lbl.config(text="Hunt stopped by user."))
                 self._set_ai_running(False)
                 return
 
-            if self.th_candidate_queue:
-                self.root.after(0, self.th_show_candidate)
-                return
-
-            end_idx = min(self.th_current_idx + 3, len(self.th_pages_buffer))
-            batch_text = "\n".join(self.th_pages_buffer[self.th_current_idx:end_idx])
-            self.th_current_idx = end_idx
+            # Accumulate pages under a character budget, advancing the index only over
+            # pages actually included, so nothing is silently skipped (I5).
+            start_idx = self.th_current_idx
+            parts = []
+            chars = 0
+            while self.th_current_idx < len(self.th_pages_buffer):
+                page = self.th_pages_buffer[self.th_current_idx]
+                if parts and (chars + len(page) > CHAR_BUDGET or len(parts) >= PAGE_CAP):
+                    break
+                parts.append(page)
+                chars += len(page)
+                self.th_current_idx += 1
+            batch_text = "\n".join(parts)[:HARD_CAP]
 
             try:
                 model = self.th_model_var.get()
@@ -1678,7 +1710,7 @@ Return JSON: {{ "findings": [ {{ "title": "short name", "description": "why this
 If no flags found, return: {{ "findings": [] }}
 
 LOGS:
-{batch_text[:15000]}"""
+{batch_text}"""
                 content = ai_chat_completion(
                     self._get_provider(), self._get_api_key(), model,
                     [{"role": "user", "content": prompt}], json_mode=True
@@ -1689,22 +1721,44 @@ LOGS:
                     if f.get("title") not in self.th_found_flags:
                         self.th_candidate_queue.append(f)
             except Exception as e:
-                err = f"[!] Analysis error on batch (pages {self.th_current_idx}): {e}"
+                err = f"[!] Analysis error on pages {start_idx + 1}-{self.th_current_idx}: {e}"
                 self.root.after(0, lambda m=err: self.th_log_history(m))
+
+            # Pause for human review as soon as we have something to show (B1).
+            if self.th_candidate_queue:
+                self.root.after(0, self.th_show_candidate)
+                return
+
+        # All pages processed with nothing pending: hand off so completion is reported
+        # exactly once (queue is empty here, so th_show_candidate finishes the hunt).
         self._set_ai_running(False)
-        self.root.after(0, lambda: messagebox.showinfo("Done", "Hunt Complete."))
+        self.root.after(0, self.th_show_candidate)
 
     def th_show_candidate(self):
-        if not self.th_candidate_queue:
-            self._ai_cancel_event.clear()
+        # Show the next queued candidate if there is one.
+        if self.th_candidate_queue:
+            finding = self.th_candidate_queue.pop(0)
+            formatted = AzureSentinelFormatter.format_log(finding)
+            self.th_editor.delete("1.0", "end")
+            self.th_editor.insert("1.0", formatted)
+            self.th_status_lbl.config(text="Waiting for Verification...")
+            return
+
+        # Queue empty: resume processing only if pages remain and we weren't stopped.
+        if self.th_current_idx < len(self.th_pages_buffer) and not self._ai_cancelled():
             self._set_ai_running(True)
             threading.Thread(target=self.th_process_batch_thread, daemon=True).start()
             return
-        finding = self.th_candidate_queue.pop(0)
-        formatted = AzureSentinelFormatter.format_log(finding)
-        self.th_editor.delete("1.0", "end")
-        self.th_editor.insert("1.0", formatted)
-        self.th_status_lbl.config(text="Waiting for Verification...")
+
+        # Nothing to review and nothing left to process (B1: no restart, no popup spam).
+        self._set_ai_running(False)
+        if self.th_pages_buffer and self.th_current_idx >= len(self.th_pages_buffer):
+            self.th_status_lbl.config(text="Status: Hunt complete.")
+            if not self._th_complete_logged:
+                self.th_log_history("[DONE] Hunt complete.")
+                self._th_complete_logged = True
+        else:
+            self.th_status_lbl.config(text="Status: Idle")
 
     def th_manual_add(self):
         """Allows manual entry of a flag."""
@@ -1727,37 +1781,48 @@ LOGS:
         self.th_status_lbl.config(text="Waiting for Verification of Manual Entry...")
 
     def th_verify(self):
+        # Ignore a second click while a note is already being drafted.
+        if self._th_verifying:
+            return
         try:
             content = self.th_editor.get("1.0", "end").strip()
-            if not content: return
+            if not content:
+                return
             data = parse_ai_json(content)
-            title = data.get("AlertName", data.get("title", "Unknown"))
-            description = data.get("Description", "")
-            flag_answer = data.get("FlagAnswer", data.get("flag_answer", ""))
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid JSON or Error: {e}")
+            return
 
-            # --- NEW AUTO-NOTE LOGIC ---
-            self.th_status_lbl.config(text="Drafting Flag Note (AI)...")
-            self.root.update()
+        title = data.get("AlertName", data.get("title", "Unknown"))
+        description = data.get("Description", "")
+        flag_answer = data.get("FlagAnswer", data.get("flag_answer", ""))
+        focus_id = self.active_flag_var.get()
 
-            focus_id = self.active_flag_var.get()
+        # Find the hint linked to the current focus (for note context).
+        relevant_hint = "No specific hint linked."
+        if focus_id != "General/All":
+            for h in self.ctf_hints:
+                if h.get('id') == focus_id:
+                    relevant_hint = h.get('hint', '')
+                    break
 
-            # Find relevant hint
-            relevant_hint = "No specific hint linked."
-            if focus_id != "General/All":
-                for h in self.ctf_hints:
-                    if h.get('id') == focus_id:
-                        relevant_hint = h.get('hint', '')
-                        break
+        evidence = data.get("Evidence", str(data))
 
-            # Draft Note
-            suggested_note = ""
-            try:
-                if not self._get_api_key():
-                    raise ValueError("API key not configured")
-                # Use the findings specific evidence if available
-                evidence = data.get("Evidence", str(data))
+        # Draft the note off the UI thread so the app stays responsive (B2).
+        self._th_verifying = True
+        self.th_status_lbl.config(text="Drafting Flag Note (AI)...")
+        threading.Thread(
+            target=self._th_note_thread,
+            args=(title, description, flag_answer, focus_id, relevant_hint, evidence),
+            daemon=True,
+        ).start()
 
-                prompt = f"""Context: CTF Investigation. Focus: {focus_id}.
+    def _th_note_thread(self, title, description, flag_answer, focus_id, relevant_hint, evidence):
+        suggested_note = ""
+        try:
+            if not self._get_api_key():
+                raise ValueError("API key not configured")
+            prompt = f"""Context: CTF Investigation. Focus: {focus_id}.
 Hint provided: "{relevant_hint}"
 
 The analyst found this:
@@ -1770,62 +1835,59 @@ Task: Write a very brief (1-sentence) note stating the EXACT flag answer or arti
 If a flag_answer is provided, include it verbatim in your note.
 Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
 """
+            provider = self._get_provider()
+            # Use a fast model for note generation.
+            fast_models = {"OpenAI": "gpt-4o-mini", "Gemini": "gemini-2.0-flash", "Claude": "claude-haiku-4-5-20251001"}
+            fast_model = fast_models.get(provider, PROVIDER_DEFAULTS.get(provider, DEFAULT_MODEL))
+            suggested_note = ai_chat_completion(
+                provider, self._get_api_key(), fast_model,
+                [{"role": "user", "content": prompt}], max_tokens=60
+            ).strip()
+        except Exception as ai_e:
+            print(f"Note Gen Error: {ai_e}")
+            suggested_note = f"Flag answer: {flag_answer}" if flag_answer else f"Found {title}. Evidence: {str(evidence)[:120]}"
 
-                provider = self._get_provider()
-                # Use a fast model for note generation
-                fast_models = {"OpenAI": "gpt-4o-mini", "Gemini": "gemini-2.0-flash", "Claude": "claude-haiku-4-5-20251001"}
-                fast_model = fast_models.get(provider, PROVIDER_DEFAULTS.get(provider, DEFAULT_MODEL))
-                suggested_note = ai_chat_completion(
-                    provider, self._get_api_key(), fast_model,
-                    [{"role": "user", "content": prompt}], max_tokens=60
-                ).strip()
-            except Exception as ai_e:
-                print(f"Note Gen Error: {ai_e}")
-                if flag_answer:
-                    suggested_note = f"Flag answer: {flag_answer}"
-                else:
-                    suggested_note = f"Found {title}. Evidence: {data.get('Evidence', 'See logs')}"
+        # Hand back to the UI thread to show the dialog and save.
+        self.root.after(0, lambda: self._th_finish_verify(title, description, focus_id, suggested_note))
 
-            # Dialog
+    def _th_finish_verify(self, title, description, focus_id, suggested_note):
+        try:
+            self.th_status_lbl.config(text="Status: Idle")
             note = simpledialog.askstring(
                 "Flag Answer/Note",
                 f"Verified '{title}'.\nEdit the generated note below:",
-                initialvalue=suggested_note
+                initialvalue=suggested_note,
             )
+            if note is None:
+                return  # Cancelled - leave the candidate in the editor to retry.
+            if not note:
+                note = "No specific note provided."
 
-            self.th_status_lbl.config(text="Idle")
-            if note is None: return # Cancelled
-            if not note: note = "No specific note provided."
-            # ---------------------------
-
-            # Save
             self.th_found_flags.add(title)
             self.th_log_history(f"[FLAG] {title}")
-
-            # Store in Summary Data
             self.verified_flags_data.append({
                 "title": title,
                 "description": description,
                 "note": note,
-                "focus_id": focus_id
+                "focus_id": focus_id,
             })
             self._update_summary_display()
 
             # --- OPTIONAL AUTO-REFRESH (off by default) ---
             # Regenerating the full Incident Report and Flag Bank narrative on every
             # single verify is slow and expensive, and clobbers manual report edits.
-            # Only do it when the analyst explicitly opts in via the checkbox.
             if self.auto_update_var.get():
                 self.root.after(500, self.auto_generate_incident_report)
                 self.root.after(1000, self.update_flag_bank_ai)
-            # ------------------------------------
 
             self.th_editor.delete("1.0", "end")
             self.th_show_candidate()
-        except Exception as e:
-            messagebox.showerror("Error", f"Invalid JSON or Error: {e}")
+        finally:
+            self._th_verifying = False
 
     def th_discard(self):
+        if self._th_verifying:
+            return  # don't discard while a note is drafting for the current candidate
         self.th_editor.delete("1.0", "end")
         self.th_show_candidate()
 
@@ -1923,16 +1985,18 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         # --- AUTO-SAVE LOGIC ---
         try:
             ts = int(time.time())
-            filename = f"azure_raw_logs_{ts}.jsonl"
+            # Keep captures tidy in a dedicated folder, and use the ABSOLUTE path so
+            # the Threat Hunter can still read it regardless of the working directory.
+            os.makedirs(CAPTURE_DIR, exist_ok=True)
+            filename = os.path.join(CAPTURE_DIR, f"azure_raw_logs_{ts}.jsonl")
 
-            # FIX: Write to file in thread, but update GUI safely
             with open(filename, "w", encoding="utf-8") as f:
                 for r in results:
                     f.write(json.dumps(r, default=str) + "\n")
 
             self.soc_print(f"{Fore.CYAN}Saved {len(results)} raw logs to {filename} and added to Threat Hunter.{Fore.RESET}")
 
-            # FIX: Update file listbox safely
+            # Update file listbox safely on the UI thread.
             if filename not in self.th_files:
                 def _add_file():
                     self.th_files.append(filename)
@@ -2096,8 +2160,15 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             self._set_ai_running(False)
 
     def soc_gen_kql(self):
-        if not self._soc_precheck(): return
+        # Generating KQL doesn't touch Azure, so it only needs an API key (not a
+        # Workspace ID). Full _soc_precheck is reserved for paths that run queries.
+        if not self._get_api_key():
+            messagebox.showerror("Config Error", "Please set an API Key in the Configuration tab.")
+            return
         user_input = self.soc_prompt_text.get("1.0", "end").strip()
+        if not user_input:
+            messagebox.showinfo("Input", "Please enter instructions above.")
+            return
         threading.Thread(target=self._soc_kql_only_thread, args=(user_input,), daemon=True).start()
 
     def _soc_kql_only_thread(self, user_input):
@@ -2724,8 +2795,15 @@ TASK 3: INVESTIGATION REPORT
         frame = ttk.LabelFrame(self.tab_session, text="Session Management", padding=20)
         frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        lbl = ttk.Label(frame, text="Save or Load the entire application state (including API Keys).", font=("Segoe UI", 12))
+        lbl = ttk.Label(frame, text="Save or Load the entire application state (hints, flags, queries, reports).", font=("Segoe UI", 12))
         lbl.pack(pady=10)
+
+        ttk.Checkbutton(frame, text="Include API keys in the saved file",
+                        variable=self.save_keys_var).pack(anchor="w", pady=(0, 2))
+        ttk.Label(frame,
+                  text="⚠️  Session files are plaintext JSON. Leave this off unless the file stays private —\n"
+                       "otherwise anyone with the file gets your API keys. Keys load from env vars regardless.",
+                  foreground="#b5651d", font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 10))
 
         btn_save = ttk.Button(frame, text="💾 Save Full Session", command=self.save_full_session)
         btn_save.pack(fill="x", pady=5)
@@ -3089,12 +3167,15 @@ FIRST LAUNCH
         guide_text.config(state="disabled")
 
     def save_full_session(self):
+        # Only persist API keys when the analyst explicitly opts in (they are stored
+        # in plaintext). Otherwise write empty strings; keys still load from env vars.
+        include_keys = self.save_keys_var.get()
         data = {
             "config": {
                 "provider": self.provider_var.get(),
-                "api_key_openai": self.api_key_vars["OpenAI"].get(),
-                "api_key_gemini": self.api_key_vars["Gemini"].get(),
-                "api_key_claude": self.api_key_vars["Claude"].get(),
+                "api_key_openai": self.api_key_vars["OpenAI"].get() if include_keys else "",
+                "api_key_gemini": self.api_key_vars["Gemini"].get() if include_keys else "",
+                "api_key_claude": self.api_key_vars["Claude"].get() if include_keys else "",
                 "workspace_id": self.workspace_id_var.get(),
                 "custom_models": self.custom_models
             },
@@ -3144,12 +3225,17 @@ FIRST LAUNCH
             if "config" in data:
                 cfg = data["config"]
                 self.provider_var.set(cfg.get("provider", "OpenAI"))
-                # Support both old single-key and new multi-key formats
+                # Only overwrite a key when the session actually carries one, so
+                # loading a key-less session (I3) doesn't wipe keys already entered
+                # or supplied via environment variables.
                 if "api_key_openai" in cfg:
-                    self.api_key_vars["OpenAI"].set(cfg.get("api_key_openai", ""))
-                    self.api_key_vars["Gemini"].set(cfg.get("api_key_gemini", ""))
-                    self.api_key_vars["Claude"].set(cfg.get("api_key_claude", ""))
-                elif "api_key" in cfg:
+                    for prov, key in (("OpenAI", "api_key_openai"),
+                                      ("Gemini", "api_key_gemini"),
+                                      ("Claude", "api_key_claude")):
+                        val = cfg.get(key, "")
+                        if val:
+                            self.api_key_vars[prov].set(val)
+                elif cfg.get("api_key"):
                     # Legacy format: single OpenAI key
                     self.api_key_vars["OpenAI"].set(cfg.get("api_key", ""))
                 self.workspace_id_var.set(cfg.get("workspace_id", ""))
