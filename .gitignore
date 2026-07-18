@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# Auto-captured SOC query results and legacy in-place captures
+soc_captured_logs/
+azure_raw_logs_*.jsonl
