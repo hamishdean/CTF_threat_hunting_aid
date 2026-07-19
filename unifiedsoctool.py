@@ -302,6 +302,22 @@ def extract_iocs(text):
 
     return {k: sorted(v) for k, v in results.items()}
 
+def merge_iocs(a, b):
+    """Merge two IOC dicts: per-category union, case-insensitive dedupe (first-seen
+    casing wins), sorted. Used by the IOC tab's 'Add to existing' mode."""
+    out = {}
+    for category in set(a) | set(b):
+        seen = set()
+        values = []
+        for v in list(a.get(category, [])) + list(b.get(category, [])):
+            key = v.lower()
+            if key not in seen:
+                seen.add(key)
+                values.append(v)
+        if values:
+            out[category] = sorted(values)
+    return out
+
 # ------------------------------------------
 # TIMELINE BUILDER (deterministic - no AI)
 # ------------------------------------------
@@ -676,6 +692,17 @@ def parse_ai_json(content):
     except (json.JSONDecodeError, TypeError):
         snippet = " ".join(content.split())[:200]
         raise ValueError(f"AI did not return valid JSON. Response was: {snippet}")
+
+def csv_safe_cell(value):
+    """Quote a value for CSV and neutralize spreadsheet formula injection.
+
+    IOCs and findings are attacker-controlled, so a cell beginning with = + - @
+    (or a tab/CR) is prefixed with a single quote to stop Excel/Sheets executing
+    it as a formula when the export is opened."""
+    s = str(value)
+    if s[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        s = "'" + s
+    return '"' + s.replace('"', '""') + '"'
 
 def get_query_context(provider, api_key, user_input, model, history=None, hints=None, active_focus="General/All", incident_context=""):
     # Keep context concise to avoid confusing the KQL generator
@@ -1129,6 +1156,7 @@ class UnifiedSOCTool:
         self.auto_update_var = tk.BooleanVar(value=False)
 
         self.ioc_results = {}  # category -> list of indicators (from IOC tab)
+        self.ioc_accumulate_var = tk.BooleanVar(value=False)  # merge vs replace on extract
 
         # Off by default: don't write API keys into saved session files (they are
         # plaintext JSON). The analyst can opt in from the Session Manager tab.
@@ -1391,6 +1419,11 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self.hint_display = scrolledtext.ScrolledText(bot_frame, font=("Consolas", 10), state="disabled")
         self.hint_display.pack(fill="both", expand=True)
 
+        hint_btn_row = ttk.Frame(bot_frame)
+        hint_btn_row.pack(fill="x", pady=(5, 0))
+        ttk.Button(hint_btn_row, text="🗑 Remove Hint…", command=self.hints_remove).pack(side="left", padx=2)
+        ttk.Button(hint_btn_row, text="🗑 Clear All Hints", command=self.hints_clear_all).pack(side="left", padx=2)
+
     def hint_analyze(self):
         hint_text = self.hint_input.get("1.0", "end-1c").strip()
         flag_id = self.new_hint_flag_var.get()
@@ -1436,6 +1469,42 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self.hint_display.insert("end", msg)
         self.hint_display.see("end")
         self.hint_display.config(state="disabled")
+
+    def _render_hints(self):
+        """Rebuild the hints panel from self.ctf_hints (authoritative after edits)."""
+        self.hint_display.config(state="normal")
+        self.hint_display.delete("1.0", "end")
+        for h in self.ctf_hints:
+            self.hint_display.insert(
+                "end",
+                f"✅ HINT ({h.get('id', '?')}):\nHint: {h.get('hint', '')}\n"
+                f"AI Clue: {h.get('clue', '')}\nSuggested KQL: {h.get('kql', '')}\n" + "-" * 50 + "\n"
+            )
+        self.hint_display.config(state="disabled")
+
+    def hints_clear_all(self):
+        """Remove every hint (with confirmation)."""
+        if not self.ctf_hints:
+            return
+        if not messagebox.askyesno("Clear All Hints", f"Remove all {len(self.ctf_hints)} hint(s)?"):
+            return
+        self.ctf_hints = []
+        self._render_hints()
+
+    def hints_remove(self):
+        """Remove one or more selected hints."""
+        if not self.ctf_hints:
+            messagebox.showinfo("No Hints", "There are no hints to remove.")
+            return
+        snapshot = list(self.ctf_hints)
+        labels = [f"[{h.get('id', '?')}] {h.get('hint', '')[:70]}" for h in snapshot]
+
+        def remove(idxs):
+            remove_ids = {id(snapshot[i]) for i in idxs}
+            self.ctf_hints = [h for h in self.ctf_hints if id(h) not in remove_ids]
+            self._render_hints()
+
+        self._open_remove_dialog("Remove Hint", "Select hint(s) to remove:", labels, remove)
 
     # -------------------------------------------------------------------------
     # HELPER: GET ACTIVE HINTS & CONTEXT
@@ -2413,6 +2482,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         ttk.Button(btn_row, text="📄 Extract from Loaded Files", command=self.ioc_extract_from_files).pack(side="left", padx=2)
         ttk.Button(btn_row, text="🏁 Extract from Findings & Logs", command=self.ioc_extract_from_findings).pack(side="left", padx=2)
         ttk.Button(btn_row, text="🧹 Clear", command=self.ioc_clear).pack(side="left", padx=2)
+        ttk.Checkbutton(btn_row, text="Add to existing", variable=self.ioc_accumulate_var).pack(side="left", padx=10)
         self.ioc_count_lbl = ttk.Label(btn_row, text="0 indicators", foreground="gray")
         self.ioc_count_lbl.pack(side="right", padx=5)
 
@@ -2466,14 +2536,18 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         if not text.strip():
             messagebox.showinfo("No Text", "No readable text found in the loaded files.")
             return
-        self._ioc_set_results(extract_iocs(text), source="loaded files")
+        new = extract_iocs(text)
+        merged = merge_iocs(self.ioc_results, new) if self.ioc_accumulate_var.get() else new
+        self._ioc_set_results(merged, source="loaded files")
 
     def ioc_extract_from_findings(self):
         text = self._ioc_gather_findings_text()
         if not text.strip():
             messagebox.showinfo("No Data", "No findings, hints, or SOC results available yet.")
             return
-        self._ioc_set_results(extract_iocs(text), source="findings & logs")
+        new = extract_iocs(text)
+        merged = merge_iocs(self.ioc_results, new) if self.ioc_accumulate_var.get() else new
+        self._ioc_set_results(merged, source="findings & logs")
 
     def _ioc_populate_tree(self, source=""):
         """Refresh the IOC table from self.ioc_results and update the count label.
@@ -2550,8 +2624,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                     fh.write("type,indicator\n")
                     for category in IOC_PATTERNS:
                         for value in self.ioc_results.get(category, []):
-                            safe = '"' + str(value).replace('"', '""') + '"'
-                            fh.write(f"{category},{safe}\n")
+                            fh.write(f"{csv_safe_cell(category)},{csv_safe_cell(value)}\n")
                 messagebox.showinfo("Exported", f"IOCs saved to {os.path.basename(f)}")
             except Exception as e:
                 messagebox.showerror("Export Error", str(e))
@@ -2571,6 +2644,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         ttk.Button(btn_box, text="Refresh Display", command=self._update_summary_display).pack(side="right")
         ttk.Button(btn_box, text="💾 Export to .txt", command=self.summary_export).pack(side="right", padx=5)
         ttk.Button(btn_box, text="📋 Copy", command=self.summary_copy).pack(side="right")
+        ttk.Button(btn_box, text="🗑 Remove Finding…", command=self.summary_remove_finding).pack(side="left")
 
     def summary_copy(self):
         """Copy the findings summary to the clipboard."""
@@ -2596,6 +2670,59 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             messagebox.showinfo("Exported", f"Summary saved to {os.path.basename(f)}")
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
+
+    def _open_remove_dialog(self, title, prompt, labels, on_remove_indices):
+        """Generic modal picker: an extended-select listbox of `labels`; calls
+        on_remove_indices(sorted_selected_indices) on confirm. Shared by the
+        finding and hint removers."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("640x400")
+        ttk.Label(win, text=prompt).pack(anchor="w", padx=10, pady=(10, 5))
+
+        list_frame = ttk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical")
+        lb = tk.Listbox(list_frame, selectmode="extended", yscrollcommand=scroll.set)
+        scroll.config(command=lb.yview)
+        scroll.pack(side="right", fill="y")
+        lb.pack(side="left", fill="both", expand=True)
+        for text in labels:
+            lb.insert("end", text)
+
+        def do_remove():
+            idxs = sorted(lb.curselection())
+            win.destroy()
+            if idxs:
+                on_remove_indices(idxs)
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btn_frame, text="Remove Selected", command=do_remove).pack(side="right")
+        ttk.Button(btn_frame, text="Cancel", command=win.destroy).pack(side="right", padx=5)
+
+    def summary_remove_finding(self):
+        """Remove one or more verified findings (e.g. false positives)."""
+        if not self.verified_flags_data:
+            messagebox.showinfo("Nothing to Remove", "No verified findings yet.")
+            return
+        # Same sorted order as the Summary display, so the list lines up visually.
+        ordered = sorted(self.verified_flags_data, key=lambda x: x.get('title', ''))
+        labels = [f"{it.get('title', '?')} — {(it.get('note') or '')[:70]}" for it in ordered]
+
+        def remove(idxs):
+            remove_ids = {id(ordered[i]) for i in idxs}
+            removed_titles = {ordered[i].get('title') for i in idxs}
+            self.verified_flags_data = [f for f in self.verified_flags_data if id(f) not in remove_ids]
+            self.th_found_flags -= {t for t in removed_titles if t}
+            for t in removed_titles:
+                if t:
+                    self.th_log_history(f"[REMOVED] {t}")
+            self._update_summary_display()
+
+        self._open_remove_dialog("Remove Finding",
+                                 "Select finding(s) to remove (this is permanent):",
+                                 labels, remove)
 
     def _update_summary_display(self):
         self.summary_text.config(state="normal")
