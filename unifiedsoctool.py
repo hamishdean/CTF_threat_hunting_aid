@@ -530,6 +530,32 @@ Your task:
 7. If data is missing for a template section, note it as "Not enough data available".
 """
 
+def _is_transient_error(exc):
+    """True if an AI API error looks worth retrying (rate limit, 5xx, connection)."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status in (429, 500, 502, 503, 504):
+        return True
+    msg = str(exc).lower()
+    markers = ("rate limit", "ratelimit", "429", "overloaded", "timeout", "timed out",
+               "temporarily unavailable", "503", "502", "504", "connection", "reset by peer")
+    return any(m in msg for m in markers)
+
+def call_with_retry(fn, attempts=3, base_delay=1.0):
+    """Call fn(), retrying transient failures with exponential backoff.
+
+    Non-transient errors (auth, bad request) are re-raised immediately so real
+    problems still surface fast."""
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i == attempts - 1 or not _is_transient_error(e):
+                raise
+            time.sleep(base_delay * (2 ** i))
+    raise last
+
 def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_tokens=4096, temperature=None):
     """Unified AI completion wrapper supporting OpenAI, Gemini, and Claude.
 
@@ -560,7 +586,7 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
             kwargs[token_param] = max_tokens
         if temperature is not None and not needs_completion_tokens:
             kwargs["temperature"] = temperature
-        response = client.chat.completions.create(**kwargs)
+        response = call_with_retry(lambda: client.chat.completions.create(**kwargs))
         # content is None when a reasoning model hits the token cap before
         # emitting text; return "" so callers/parse_ai_json fail cleanly.
         return response.choices[0].message.content or ""
@@ -590,7 +616,7 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
             kwargs["system"] = system_text.strip()
         if temperature is not None:
             kwargs["temperature"] = temperature
-        response = client.messages.create(**kwargs)
+        response = call_with_retry(lambda: client.messages.create(**kwargs))
         # Return the first text block; guard against empty or non-text content.
         for block in response.content:
             if getattr(block, "type", None) == "text":
@@ -623,7 +649,7 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
             first_content = contents[0]["parts"][0]
             contents[0]["parts"][0] = system_text.strip() + "\n\n" + first_content
         model_obj = genai.GenerativeModel(model, generation_config=gen_config if gen_config else None)
-        response = model_obj.generate_content(contents)
+        response = call_with_retry(lambda: model_obj.generate_content(contents))
         # response.text raises when the model returned no text part (blocked or
         # empty); fall back to assembling text from the candidate parts.
         try:
@@ -831,16 +857,20 @@ LOG DATA:
 
 class ThreatHuntReporterTab:
     """Encapsulates the HuntLogApp logic within a Frame."""
-    def __init__(self, parent_frame):
+    def __init__(self, parent_frame, findings_provider=None):
         self.parent = parent_frame
         self.entries = []
         self.current_images = []
+        # Optional callable returning the app's verified findings (for one-click import).
+        self.findings_provider = findings_provider
         self._init_ui()
 
     def _init_ui(self):
         toolbar = ttk.Frame(self.parent, padding=5)
         toolbar.pack(fill=tk.X)
         ttk.Label(toolbar, text="HuntLog Reporter Module", font=("Segoe UI", 9, "italic")).pack(side=tk.RIGHT)
+        if self.findings_provider:
+            ttk.Button(toolbar, text="⬇ Import Verified Findings", command=self.import_findings).pack(side=tk.LEFT)
 
         self.notebook = ttk.Notebook(self.parent)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -1016,6 +1046,41 @@ class ThreatHuntReporterTab:
         self.tree.insert("", tk.END, values=(entry['title'], entry['category'], str(len(entry['images']))))
         self.clear_form()
 
+    def import_findings(self):
+        """Pull the app's verified findings into the report as entries (dedup by title)."""
+        findings = self.findings_provider() if self.findings_provider else []
+        if not findings:
+            messagebox.showinfo("No Findings", "No verified findings to import yet.")
+            return
+        existing = {en.get('title') for en in self.entries}
+        added = 0
+        for f in findings:
+            title = f.get('title') or "Untitled Finding"
+            if title in existing:
+                continue
+            methodology = ""
+            if f.get('focus_id') and f['focus_id'] != 'General/All':
+                methodology += f"Investigation focus: {f['focus_id']}\n"
+            if f.get('source'):
+                methodology += f"Source: {f['source']}"
+            entry = {
+                "title": title,
+                "category": "Log Analysis",
+                "description": f.get('description') or f.get('note', ''),
+                "methodology": methodology.strip(),
+                "kql_query": "",
+                "flag": f.get('note', ''),
+                "images": []
+            }
+            self.entries.append(entry)
+            self.tree.insert("", tk.END, values=(entry['title'], entry['category'], "0"))
+            existing.add(title)
+            added += 1
+        if added:
+            messagebox.showinfo("Imported", f"Imported {added} finding(s) into the report.")
+        else:
+            messagebox.showinfo("Nothing New", "All verified findings are already in the report.")
+
     def delete_entry(self):
         selected = self.tree.selection()
         if selected:
@@ -1073,8 +1138,14 @@ class ThreatHuntReporterTab:
                     doc.add_heading('Evidence', level=3)
                     for img in e['images']:
                         if os.path.exists(img['path']):
-                            doc.add_picture(img['path'], width=Inches(6))
-                            doc.add_paragraph(f"Caption: {img['caption']}", style="Caption")
+                            # Skip a single bad/unsupported image instead of aborting the whole report.
+                            try:
+                                doc.add_picture(img['path'], width=Inches(6))
+                                doc.add_paragraph(f"Caption: {img['caption']}", style="Caption")
+                            except Exception as img_err:
+                                doc.add_paragraph(f"[Image could not be embedded: {os.path.basename(img['path'])} — {img_err}]")
+                        else:
+                            doc.add_paragraph(f"[Image not found: {os.path.basename(img['path'])}]")
 
                 doc.add_heading('Flag', level=2)
                 run = doc.add_paragraph().add_run(e['flag'])
@@ -1239,7 +1310,7 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self._setup_session_tab()
 
         self._setup_guide_tab()
-        self.reporter = ThreatHuntReporterTab(self.tab_report)
+        self.reporter = ThreatHuntReporterTab(self.tab_report, findings_provider=lambda: self.verified_flags_data)
 
     # -------------------------------------------------------------------------
     # CONFIGURATION
@@ -1304,8 +1375,13 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         return self.provider_var.get()
 
     def _get_api_key(self):
-        """Return the API key for the currently selected provider."""
-        return self.api_key_vars[self.provider_var.get()].get()
+        """Return the API key for the currently selected provider (whitespace trimmed
+        so a pasted key with a trailing space/newline doesn't fail auth cryptically)."""
+        return self.api_key_vars[self.provider_var.get()].get().strip()
+
+    def _get_workspace_id(self):
+        """Return the Azure Log Analytics workspace ID, whitespace trimmed."""
+        return self.workspace_id_var.get().strip()
 
     def _get_models_for_provider(self, provider=None):
         """Return built-in + custom models for the given provider."""
@@ -2048,7 +2124,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                 "pip install azure-identity azure-monitor-query"
             )
             return False
-        if not self._get_api_key() or not self.workspace_id_var.get():
+        if not self._get_api_key() or not self._get_workspace_id():
             messagebox.showerror("Config Error", "Please set API Key and Workspace ID in Configuration Tab.")
             return False
         return True
@@ -2258,7 +2334,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             # Default to 1 year (8760h) for AI queries
             time_range = ctx.get('time_range_hours', 8760)
 
-            results = execute_kql(law_client, self.workspace_id_var.get(), kql, time_range)
+            results = execute_kql(law_client, self._get_workspace_id(), kql, time_range)
 
             if self._ai_cancelled():
                 self.soc_print(f"{Fore.YELLOW}--- AI INVESTIGATION STOPPED ---{Fore.RESET}")
@@ -2341,7 +2417,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         self.last_kql = kql
         try:
             law_client = LogsQueryClient(credential=DefaultAzureCredential())
-            results = execute_kql(law_client, self.workspace_id_var.get(), kql, hours=8760)
+            results = execute_kql(law_client, self._get_workspace_id(), kql, hours=8760)
             self.soc_last_records = results
 
             if self._ai_cancelled():
