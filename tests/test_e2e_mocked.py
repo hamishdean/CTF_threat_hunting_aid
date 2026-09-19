@@ -17,7 +17,35 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import unifiedsoctool as u  # noqa: E402
+import importlib  # noqa: E402
+import pkgutil  # noqa: E402
+import soctool  # noqa: E402
+
+# The app is a package; the code under test imports helpers by name into each
+# module, so a monkeypatch has to land in every module that holds the name.
+# This proxy reads from the first module that has the attribute and writes to
+# all of them, which keeps the checks below as simple as `u.name = fake`.
+_MODULES = [importlib.import_module(m.name) for m in pkgutil.walk_packages(soctool.__path__, "soctool.")] + [soctool]
+
+
+class _PackageProxy:
+    def __getattr__(self, name):
+        for m in _MODULES:
+            if hasattr(m, name):
+                return getattr(m, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        hit = False
+        for m in _MODULES:
+            if hasattr(m, name):
+                setattr(m, name, value)
+                hit = True
+        if not hit:
+            raise AttributeError(f"{name} not found in any soctool module")
+
+
+u = _PackageProxy()
 import tkinter as tk  # noqa: E402
 from azure.monitor.query import LogsQueryResult, LogsTable  # noqa: E402
 
