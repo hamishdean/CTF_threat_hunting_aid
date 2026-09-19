@@ -108,3 +108,11 @@ except ImportError:
         pass
 
 __all__ = ['tk', 'ttk', 'messagebox', 'filedialog', 'simpledialog', 'scrolledtext', 'HAS_TK', 'PdfReader', 'HAS_PYPDF', 'pd', 'HAS_PANDAS', 'Fore', 'Style', 'init', 'HAS_COLORAMA', 'OpenAI', 'HAS_OPENAI', 'DefaultAzureCredential', 'LogsQueryClient', 'HttpResponseError', 'ClientAuthenticationError', 'HAS_AZURE', 'Document', 'Inches', 'Pt', 'RGBColor', 'WD_ALIGN_PARAGRAPH', 'HAS_DOCX', 'anthropic', 'HAS_ANTHROPIC', 'genai', 'google_genai', 'google_genai_types', 'HAS_GEMINI', 'GEMINI_SDK', '_MISSING_LIBS']
+
+try:
+    import keyring
+    HAS_KEYRING = True
+except ImportError:
+    keyring = None
+    HAS_KEYRING = False
+__all__ += ["keyring", "HAS_KEYRING"]

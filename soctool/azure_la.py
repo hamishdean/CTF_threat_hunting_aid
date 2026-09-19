@@ -2,7 +2,8 @@
 """Azure Log Analytics access: credentials, query execution, error explanation."""
 import os
 from datetime import timedelta
-from .deps import ClientAuthenticationError, DefaultAzureCredential, HAS_AZURE
+from .deps import ClientAuthenticationError, DefaultAzureCredential, HAS_AZURE, LogsQueryClient
+import re
 
 def build_azure_credential(tenant_id=""):
     """DefaultAzureCredential tuned for an analyst workstation.
@@ -84,3 +85,46 @@ def execute_kql(law_client, workspace_id, kql, hours=8760, warn=None):
         return results
     except Exception as e:
         raise e
+
+def make_logs_client(tenant_id=""):
+    """LogsQueryClient wired to build_azure_credential (one place to change auth)."""
+    if not HAS_AZURE:
+        raise ImportError("Azure libraries not installed. Run: pip install azure-identity azure-monitor-query")
+    return LogsQueryClient(credential=build_azure_credential(tenant_id))
+
+# Tables that hold data in the last year, largest first.
+LIST_TABLES_KQL = ("union withsource=TableName * "
+                   "| summarize Rows=count(), Latest=max(TimeGenerated) by TableName "
+                   "| sort by Rows desc")
+
+def fetch_schema(law_client, workspace_id, tables, max_tables=40, warn=None, should_stop=None):
+    """Return {table: [column, ...]} for up to `max_tables` tables using `getschema`
+    (a metadata call, so it is cheap even on big tables). Failures on one table are
+    reported through `warn` and skipped so one odd table can't sink the whole map."""
+    schema = {}
+    for name in list(tables)[:max_tables]:
+        if should_stop and should_stop():
+            break
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(name)):
+            continue
+        try:
+            rows = execute_kql(law_client, workspace_id, f"{name} | getschema | project ColumnName, ColumnType", hours=1)
+            cols = [str(r.get("ColumnName", "")) for r in rows if r.get("ColumnName")]
+            if cols:
+                schema[name] = cols
+        except Exception as e:
+            if warn:
+                warn(f"  (schema for {name} skipped: {str(e)[:120]})")
+    return schema
+
+def format_schema(known_tables, schema_cache, max_cols=40):
+    """Compact text block for the KQL prompt: one line per table that has data,
+    with its row count and real column names (truncated)."""
+    lines = []
+    for t in known_tables or []:
+        name = t.get("TableName") if isinstance(t, dict) else str(t)
+        rows = t.get("Rows", "") if isinstance(t, dict) else ""
+        cols = schema_cache.get(name, [])
+        col_txt = ", ".join(cols[:max_cols]) + (", ..." if len(cols) > max_cols else "")
+        lines.append(f"- {name} ({rows} rows): {col_txt}" if cols else f"- {name} ({rows} rows)")
+    return "\n".join(lines)

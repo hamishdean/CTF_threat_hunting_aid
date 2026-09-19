@@ -8,16 +8,20 @@ This tool bridges the gap between CTF flag hunting and real-world SOC investigat
 
 ### Key Capabilities
 
-- **Natural-language to KQL translation** — describe what you're looking for and the AI generates valid Kusto queries targeting 30+ Azure Sentinel / Defender tables.
-- **Live Azure Log Analytics execution** — run generated (or hand-written) KQL directly against your workspace and get results in-app.
+- **Natural-language to KQL translation** — describe what you're looking for and the AI generates valid Kusto queries. Click **List Tables** once and the generator is fed the tables that actually hold data in your workspace and their real column names, so it stops inventing schema.
+- **Agentic investigation loop** — a failed or empty query is fixed by the AI and re-run automatically (configurable attempts), and after every run the agent proposes the next pivots, which you can run with one click.
+- **Live Azure Log Analytics execution** — run generated (or hand-written) KQL directly against your workspace. Results land in a sortable, filterable **Query Results** grid with copy, CSV/JSON export, "send rows to hunter" and "pivot on value".
+- **Parallel, non-blocking hunting** — result sets and files are analysed in parallel batches while you verify candidates; duplicates are dropped by the *answer value*, not just the title.
 - **File-based threat hunting** — load PDFs, DOCX, TXT, or JSONL log exports and let the AI scan them page-by-page for flags and IOCs.
 - **Deterministic IOC extraction & pivoting** — pull IPs, domains, URLs, hashes, emails, CVEs, and MITRE technique IDs from your files/findings (no API key needed, defang-aware), then pivot any indicator straight into a SOC Agent hunt or export to CSV/JSON.
 - **MITRE ATT&CK mapping** — incident reports and the Flag Bank narrative map observed activity to ATT&CK tactics/techniques.
-- **AI-assisted finding verification** — each candidate finding is presented for human review before being promoted to a verified flag.
+- **AI-assisted finding verification** — each candidate finding is presented for human review before being promoted to a verified flag. Every finding carries the KQL that produced it and the raw rows that contain the answer, all the way into the reports.
+- **Timeline** — verified findings and query results in chronological order, shared with the incident report.
 - **Flag Bank & narrative builder** — accumulate verified findings and let the AI synthesize them into a cohesive incident narrative.
 - **DOCX report generation** — export individual finding write-ups (with screenshots, KQL queries, and evidence) to a formatted Word document.
 - **Incident report generator** — feed all findings, hints, and context into a template-driven AI report writer.
-- **Full session save/load** — persist your entire investigation state (config, hints, flags, queries, reports) to a JSON file.
+- **Full session save/load** — persist your entire investigation state (config, hints, flags, queries, results, schema, reports) to a JSON file.
+- **Settings that survive a restart** — provider, models, workspace, tenant and agent options are remembered; API keys can optionally be kept in the OS keyring (never in a plain file).
 
 ## Screenshots
 
@@ -28,8 +32,10 @@ This tool bridges the gap between CTF flag hunting and real-world SOC investigat
 | ⚙️ Configuration | API key and workspace ID setup |
 | 🧩 Flag Hints | Add CTF hints; AI suggests what to look for and generates starter KQL |
 | 🕵️ Threat Hunter | Load log files, run AI-driven page-by-page analysis, verify/discard findings |
-| 🛡️ Azure SOC Agent | Natural-language → KQL → execute → AI analysis pipeline against live Azure |
-| 🧬 IOCs | Extract indicators (IPs, domains, URLs, hashes, emails, CVEs, MITRE T-codes) from files/findings; pivot to SOC Agent; export CSV/JSON |
+| 🛡️ Azure SOC Agent | Natural-language → KQL → execute → AI analysis pipeline against live Azure, with auto-fix retries, List Tables/schema, and next-pivot suggestions |
+| 📊 Query Results | Grid of the rows the last query returned: sort, filter, view, copy, send to hunter, pivot, export |
+| 🕒 Timeline | Chronological view of verified findings and query results |
+| 🧬 IOCs | Extract indicators (IPs, domains, URLs, hashes, emails, CVEs, MITRE T-codes with technique names) from files/findings; pivot to SOC Agent; export CSV/JSON |
 | 🏦 Flag Bank | AI-generated narrative connecting all verified findings |
 | 🏆 Flag Summary | Overview of all verified flags |
 | 📝 Report Editor | Build per-finding entries with screenshots for Word export |
@@ -51,6 +57,7 @@ pip install -r requirements.txt
 ```
 
 Optional providers: `pip install anthropic` (Claude) and `pip install google-genai` (Gemini).
+Optional: `pip install keyring` to remember API keys in the OS keyring between launches.
 
 ### External Services
 
@@ -61,7 +68,7 @@ Optional providers: `pip install anthropic` (Claude) and `pip install google-gen
 | **Azure Tenant ID** (optional) | SOC Agent tab when the workspace is in a tenant where you are a guest (common for CTFs) | Enter in the Configuration tab or set `AZURE_TENANT_ID` env var |
 | **Azure credentials** | SOC Agent tab | Run `az login` (add `--tenant <id>` for a guest tenant), **or** click **Test Azure Connection** and sign in via the browser window that opens |
 
-Click **🔌 Test Azure Connection** in the Configuration tab before hunting. It runs a trivial query and turns green when sign-in and the Workspace ID both work, or tells you in one line what to fix (sign-in, wrong ID, missing *Log Analytics Reader* role).
+Click **🔌 Test Azure Connection** in the Configuration tab before hunting. It runs a trivial query and turns green when sign-in and the Workspace ID both work, or tells you in one line what to fix (sign-in, wrong ID, missing *Log Analytics Reader* role). Then click **💾 Save Settings** so you don't have to type any of it again.
 
 > The Threat Hunter, Flag Hints, Report Editor, and Incident Report Generator tabs work without Azure — they only need the OpenAI API key.
 
@@ -111,7 +118,11 @@ The AI translates your request into KQL, executes it against Azure Log Analytics
 
 **Self-healing queries:** if a query fails, click **Self-Heal Last KQL** and the AI will diagnose and fix the syntax error automatically.
 
-**List Tables:** click **📋 List Tables** to see every table in the workspace that holds data (row counts and latest record). Naming one of those tables in your prompt keeps the AI from guessing a table that is empty in your environment.
+**List Tables:** click **📋 List Tables** to see every table in the workspace that holds data (row counts and latest record). The tool then fetches each table's columns with `getschema` and feeds that schema to the KQL generator and Self-Heal, so generated queries use tables and columns that really exist.
+
+**Agent mode:** the *Agent* row under the prompt controls two behaviours. *Auto-fix failed/empty queries up to N times* lets the AI repair a query that errors or returns no rows and re-run it without you. *Suggest next pivots* asks the AI, after each run, for the two or three most useful follow-up queries; pick one in the **Next** box and press **▶ Run Suggested**.
+
+**Parallel batches:** the *Parallel batches* spinner in the Threat Hunter tab (default 3) sets how many AI batches run at once for both the SOC Agent and file hunts. The file hunt no longer pauses while you verify a candidate; new candidates queue up with a pending counter in the status line.
 
 ### Supported Azure Tables
 
@@ -134,8 +145,21 @@ Each tab has its own model selector so you can use faster models for simple task
 ## Project Structure
 
 ```
-unifiedsoctool.py          # Single-file application — all logic, UI, and prompts
-tests/test_e2e_mocked.py   # Headless end-to-end exercise with mocked AI + Azure
+unifiedsoctool.py            # Launcher (python unifiedsoctool.py)
+soctool/
+  deps.py                    # Optional third-party imports and HAS_* flags
+  config.py                  # Model/provider tables, paths, saved settings + keyring
+  prompts.py                 # System prompts and JSON schemas for structured outputs
+  ai.py                      # Provider-agnostic AI calls, KQL generation, record hunting, fix/next-step agents
+  azure_la.py                # Azure credentials, query execution, table listing, schema fetch
+  textutil.py                # File extraction, chunking, IOC extraction, timeline, ATT&CK lookup
+  common.py                  # Console logger, finding formatter
+  reporter.py                # Report Editor tab (Word export)
+  guide.py                   # Built-in How-To Guide text
+  app.py                     # UnifiedSOCTool shell and main()
+  tabs/*.py                  # One mixin per notebook tab
+data/attack_techniques.json  # MITRE ATT&CK Enterprise technique IDs -> names/tactics
+tests/test_e2e_mocked.py     # Headless end-to-end exercise with mocked AI + Azure
 ```
 
 ### Running the tests
@@ -150,12 +174,7 @@ xvfb-run -a python3 tests/test_e2e_mocked.py  # headless Linux / CI
 
 ### Architecture
 
-The application is structured into four layers inside the single file:
-
-1. **Shared Configuration & Utils** — file extraction (PDF/DOCX/TXT), session logging, output formatting
-2. **Prompts & AI Utils** — system prompts for KQL generation, threat hunting, and incident reporting; Azure Log Analytics execution; AI analysis functions
-3. **Report Generator Logic** — `ThreatHuntReporterTab` class for building and exporting DOCX reports
-4. **GUI Application** — `UnifiedSOCTool` class containing all tabs and application state
+`UnifiedSOCTool` (in `soctool/app.py`) owns all application state and composes one mixin class per tab from `soctool/tabs/`. The tabs call into three service modules that have no Tk dependency and can be unit-tested directly: `ai.py` (every model call goes through `ai_chat_completion`, which handles OpenAI, Claude and Gemini, JSON schemas with fallback, and retries), `azure_la.py` (credentials, `execute_kql`, table listing and `getschema`), and `textutil.py` (deterministic extraction, IOCs, timeline, ATT&CK names). Long-running work runs on daemon threads; anything that touches Tk is marshalled back with `root.after`.
 
 ## Troubleshooting
 
@@ -168,6 +187,8 @@ The application is structured into four layers inside the single file:
 | `"Workspace not found"` | Re-check the Workspace ID and that you are signed in to the tenant that owns it. |
 | `"Access denied"` | Your account needs the **Log Analytics Reader** role on the workspace. |
 | `Azure returned PARTIAL results` | The row set was truncated by Azure; narrow the query or time range. |
+| Generated KQL uses columns that don't exist | Click **List Tables** once per workspace so the generator gets the real schema. |
+| Settings/keys not remembered | Click **Save Settings** in Configuration. Keys need `pip install keyring` and, on Linux, a Secret Service backend. |
 | `"Missing library"` | Run the `pip install` command listed under [Dependencies](#dependencies). |
 
 ## License

@@ -3,6 +3,7 @@
 import os
 import datetime
 from .deps import Document, HAS_DOCX, Inches, Pt, RGBColor, WD_ALIGN_PARAGRAPH, filedialog, messagebox, scrolledtext, simpledialog, tk, ttk
+import json
 
 class ThreatHuntReporterTab:
     """Encapsulates the HuntLogApp logic within a Frame."""
@@ -211,14 +212,23 @@ class ThreatHuntReporterTab:
             if f.get('focus_id') and f['focus_id'] != 'General/All':
                 methodology += f"Investigation focus: {f['focus_id']}\n"
             if f.get('source'):
-                methodology += f"Source: {f['source']}"
+                methodology += f"Source: {f['source']}\n"
+            if f.get('kql'):
+                methodology += "Query executed against Azure Log Analytics (see KQL below).\n"
+            description = f.get('description') or f.get('note', '')
+            rows = f.get('evidence_rows') or []
+            if rows:
+                description += "\n\nEvidence rows:\n" + "\n".join(
+                    (json.dumps(r, default=str) if isinstance(r, dict) else str(r))[:600] for r in rows[:3])
+            elif f.get('evidence') and f['evidence'] not in ("Manual Entry",):
+                description += f"\n\nEvidence: {str(f['evidence'])[:600]}"
             entry = {
                 "title": title,
-                "category": "Log Analysis",
-                "description": f.get('description') or f.get('note', ''),
+                "category": "Cloud Security" if str(f.get('source', '')).startswith("SOC query") else "Log Analysis",
+                "description": description,
                 "methodology": methodology.strip(),
-                "kql_query": "",
-                "flag": f.get('note', ''),
+                "kql_query": f.get('kql', '') or "",
+                "flag": f.get('flag_answer') or f.get('note', ''),
                 "images": []
             }
             self.entries.append(entry)

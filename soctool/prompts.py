@@ -62,6 +62,11 @@ Use `union Table1, Table2` only if the user explicitly asks to combine tables.
 3. Time filters: `| where TimeGenerated > ago(7d)` or `| where TimeGenerated between (datetime(...) .. datetime(...))`.
 4. Default time range: 365 days (`ago(365d)`) unless the user specifies otherwise. You can use up to 1 year.
 
+### WORKSPACE SCHEMA
+If the user message contains a WORKSPACE SCHEMA block, it lists the tables that
+actually hold data in this workspace and their real column names. Prefer those
+tables and use ONLY column names that appear there for the table you pick.
+
 ### OUTPUT FORMAT
 Return a SINGLE JSON object:
 {
@@ -69,11 +74,99 @@ Return a SINGLE JSON object:
     "kql_query": "DeviceProcessEvents | where DeviceName startswith 'ch-' | take 100",
     "rationale": "Searching for devices with prefix ch-",
     "fields": "TimeGenerated, DeviceName, ProcessCommandLine, AccountName",
-    "parameters": { "time_range_hours": 8760 }
+    "time_range_hours": 8760
 }
 
 CRITICAL: "fields" must be a single comma-separated string, NOT individual characters.
 """
+
+# ---------------------------------------------------------------------------
+# JSON schemas for structured outputs. OpenAI (strict mode) and Gemini enforce
+# these server-side; Claude gets them appended to the system prompt. Strict
+# mode needs every property listed in "required" and additionalProperties off.
+# ---------------------------------------------------------------------------
+_FINDING_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "description": "Short name for the finding"},
+        "description": {"type": "string", "description": "Why this answers the question"},
+        "flag_answer": {"type": "string", "description": "The EXACT value: flag, IP, user, hash, command, URL..."},
+        "severity": {"type": "string", "description": "Low, Medium, High or Critical"},
+        "confidence": {"type": "string", "description": "Low, Medium or High"},
+        "evidence": {"type": "string", "description": "Raw log line(s) proving it"},
+        "log_lines": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["title", "description", "flag_answer", "severity", "confidence", "evidence", "log_lines"],
+    "additionalProperties": False,
+}
+
+FINDINGS_SCHEMA = {
+    "name": "findings",
+    "schema": {
+        "type": "object",
+        "properties": {"findings": {"type": "array", "items": _FINDING_ITEM_SCHEMA}},
+        "required": ["findings"],
+        "additionalProperties": False,
+    },
+}
+
+KQL_SCHEMA = {
+    "name": "kql_query",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "table_name": {"type": "string"},
+            "kql_query": {"type": "string"},
+            "rationale": {"type": "string"},
+            "fields": {"type": "string", "description": "Comma-separated column list"},
+            "time_range_hours": {"type": "integer"},
+        },
+        "required": ["table_name", "kql_query", "rationale", "fields", "time_range_hours"],
+        "additionalProperties": False,
+    },
+}
+
+NEXT_STEPS_SCHEMA = {
+    "name": "next_steps",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "assessment": {"type": "string", "description": "One or two sentences on what the results mean"},
+            "suggestions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "Natural-language query to run next"},
+                        "why": {"type": "string"},
+                    },
+                    "required": ["question", "why"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["assessment", "suggestions"],
+        "additionalProperties": False,
+    },
+}
+
+SYSTEM_PROMPT_NEXT_STEPS = """
+You are a senior threat hunter guiding an investigation in Azure Sentinel / Defender.
+Given the analyst's goal, the query that was just run, a sample of its results and any
+findings, propose the 2-3 most valuable NEXT queries (pivots) in plain English, each one
+line, specific to the entities seen (device names, accounts, IPs, hashes, timestamps).
+Prefer pivots that confirm scope, find the initial access, or trace lateral movement.
+"""
+
+SYSTEM_PROMPT_KQL_FIX = """
+You are a KQL expert. A query against Azure Log Analytics failed or returned no rows.
+Fix it and return JSON: {"fixed_kql": "...", "explanation": "..."}.
+- If the error names an unknown table or column, use the WORKSPACE SCHEMA when given.
+- If the error is "0 records found", widen the time window (up to 365d) or loosen the
+  'where' filters (use has/contains instead of ==, drop a filter), but keep the intent.
+- Always keep a `| take N` limit.
+"""
+
 
 FORMATTING_INSTRUCTIONS = """
 You MUST return valid JSON. Format:

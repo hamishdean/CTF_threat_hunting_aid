@@ -35,6 +35,7 @@ class HintsTabMixin:
 
         hint_btn_row = ttk.Frame(bot_frame)
         hint_btn_row.pack(fill="x", pady=(5, 0))
+        ttk.Button(hint_btn_row, text="▶ Run Hint KQL…", command=self.hints_run_kql).pack(side="left", padx=2)
         ttk.Button(hint_btn_row, text="🗑 Remove Hint…", command=self.hints_remove).pack(side="left", padx=2)
         ttk.Button(hint_btn_row, text="🗑 Clear All Hints", command=self.hints_clear_all).pack(side="left", padx=2)
 
@@ -141,3 +142,21 @@ class HintsTabMixin:
             ctx += f"\nCURRENT INCIDENT UNDERSTANDING (Narrative):\n{bank_text}\n"
 
         return ctx
+
+    def hints_run_kql(self):
+        """Pick a hint and open its suggested KQL in the Manual KQL Editor, ready to run
+        against the workspace (results flow through the normal SOC pipeline)."""
+        with_kql = [h for h in self.ctf_hints if (h.get("kql") or "").strip()]
+        if not with_kql:
+            messagebox.showinfo("No KQL", "No hint has a suggested KQL yet. Analyze a hint first.")
+            return
+        labels = [f"[{h.get('id', '?')}] {h.get('hint', '')[:60]}  ->  {h['kql'][:70]}" for h in with_kql]
+
+        def run(idxs):
+            h = with_kql[idxs[0]]
+            if h.get("id"):
+                self.active_flag_var.set(h["id"])   # focus the investigation on that flag
+            self.notebook.select(self.tab_soc)
+            self.soc_open_manual_kql(prefill=h["kql"])
+
+        self._open_remove_dialog("Run Hint KQL", "Select the hint whose KQL you want to run:", labels, run)

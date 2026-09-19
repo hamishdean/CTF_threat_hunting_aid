@@ -25,3 +25,7 @@ azure-monitor-query>=1.2
 anthropic>=0.40          # Claude
 google-genai>=1.0        # Gemini (the older google-generativeai package is
                          # deprecated; it still works as a fallback if installed)
+
+# --- Optional quality-of-life ---
+keyring>=24              # remember API keys in the OS keyring between launches
+                         # (Linux also needs a Secret Service backend, e.g. gnome-keyring)

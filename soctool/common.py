@@ -41,6 +41,10 @@ class AzureSentinelFormatter:
             "Description": finding.get("description", ""),
             "Severity": finding.get("severity", "Medium"),
             "Evidence": finding.get("evidence", ""),
-            "Source": finding.get("source", "")
+            "Source": finding.get("source", ""),
+            # Provenance that travels with the finding into the report (KQL that
+            # produced it and the raw rows that contain the answer).
+            "KQL": finding.get("kql", ""),
+            "EvidenceRows": finding.get("evidence_rows", []),
         }
-        return json.dumps(formatted, indent=2)
+        return json.dumps(formatted, indent=2, default=str)

@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 import threading
-from ..azure_la import build_azure_credential, execute_kql, explain_azure_error
+from ..azure_la import execute_kql, explain_azure_error, make_logs_client
 from ..config import MODEL_OPTIONS, PROVIDER_DEFAULTS, PROVIDER_MODELS, PROVIDER_OPTIONS
-from ..deps import HAS_AZURE, LogsQueryClient, messagebox, ttk
+from ..deps import HAS_AZURE, messagebox, ttk
+from ..config import SETTINGS_PATH, load_settings, save_settings, keyring_available, keyring_get_key, keyring_set_key
 
 class ConfigTabMixin:
     def _setup_config_tab(self):
@@ -72,6 +73,19 @@ class ConfigTabMixin:
         self.azure_status_lbl = ttk.Label(frame, text="Azure: not tested yet", foreground="gray", wraplength=1000, justify="left")
         self.azure_status_lbl.grid(row=3, column=0, columnspan=3, sticky="w")
 
+        # Persist settings between launches
+        persist = ttk.LabelFrame(self.tab_config, text="Remember Settings", padding=12)
+        persist.pack(fill="x", padx=20, pady=10)
+        ttk.Label(persist, text=f"Provider, models, workspace, tenant and agent options are saved to {SETTINGS_PATH} "
+                                "and restored on the next launch. API keys are only stored in the OS keyring "
+                                "(never in that file) when the box below is ticked.",
+                  wraplength=1000, justify="left").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        ttk.Checkbutton(persist, text="Remember API keys in the OS keyring", variable=self.remember_keys_var).grid(row=1, column=0, sticky="w")
+        ttk.Button(persist, text="💾 Save Settings", command=self.save_settings_clicked).grid(row=1, column=1, padx=10)
+        ttk.Button(persist, text="🗑 Forget Saved Keys", command=self.forget_saved_keys).grid(row=1, column=2, padx=4)
+        self.settings_status_lbl = ttk.Label(persist, text="", foreground="gray", wraplength=1000, justify="left")
+        self.settings_status_lbl.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
     def _get_tenant_id(self):
         """Return the optional Azure tenant ID, whitespace trimmed."""
         return self.tenant_id_var.get().strip()
@@ -105,7 +119,7 @@ class ConfigTabMixin:
 
     def _test_azure_thread(self, ws, tenant_id):
         try:
-            client = LogsQueryClient(credential=build_azure_credential(tenant_id))
+            client = make_logs_client(tenant_id)
             rows = execute_kql(client, ws, "print ok=1", hours=1)
             ok = bool(rows) and str(rows[0].get("ok", "")) == "1"
             text = (f"Azure: ✅ connected. Workspace {ws} accepted a query." if ok
@@ -207,3 +221,111 @@ class ConfigTabMixin:
             self.custom_models_label.config(text=", ".join(custom), foreground="black")
         else:
             self.custom_models_label.config(text="(none)", foreground="gray")
+
+    # ------------------------------------------------------------------ saved settings
+    def _settings_snapshot(self):
+        return {
+            "provider": self.provider_var.get(),
+            "workspace_id": self.workspace_id_var.get(),
+            "tenant_id": self.tenant_id_var.get(),
+            "custom_models": self.custom_models,
+            "models": {
+                "hint": self.hint_model_var.get(), "hunter": self.th_model_var.get(),
+                "soc": self.soc_model_var.get(), "flag_bank": self.flag_bank_model_var.get(),
+                "incident": self.ir_model_var.get(),
+            },
+            "parallel_batches": self.th_workers_var.get(),
+            "soc_auto_retry": self.soc_auto_retry_var.get(),
+            "soc_suggest": bool(self.soc_suggest_var.get()),
+            "remember_keys": bool(self.remember_keys_var.get()),
+        }
+
+    def _apply_settings(self, data):
+        if not data:
+            return
+        try:
+            if data.get("provider") in PROVIDER_OPTIONS:
+                self.provider_var.set(data["provider"])
+            if data.get("workspace_id") and not self.workspace_id_var.get():
+                self.workspace_id_var.set(data["workspace_id"])
+            if data.get("tenant_id") and not self.tenant_id_var.get():
+                self.tenant_id_var.set(data["tenant_id"])
+            for prov, models in (data.get("custom_models") or {}).items():
+                if prov in self.custom_models and isinstance(models, list):
+                    self.custom_models[prov] = [m for m in models if isinstance(m, str)]
+            self._on_provider_changed()
+            models = data.get("models") or {}
+            for key, var in (("hint", self.hint_model_var), ("hunter", self.th_model_var), ("soc", self.soc_model_var),
+                             ("flag_bank", self.flag_bank_model_var), ("incident", self.ir_model_var)):
+                if models.get(key):
+                    var.set(models[key])
+            if data.get("parallel_batches"):
+                self.th_workers_var.set(int(data["parallel_batches"]))
+            if "soc_auto_retry" in data:
+                self.soc_auto_retry_var.set(int(data["soc_auto_retry"]))
+            if "soc_suggest" in data:
+                self.soc_suggest_var.set(bool(data["soc_suggest"]))
+            self.remember_keys_var.set(bool(data.get("remember_keys")))
+        except Exception as e:
+            print(f"Saved settings partially applied: {e}")
+
+    def _load_saved_settings(self):
+        """Called once at startup: restore non-secret settings and, if opted in,
+        pull API keys from the OS keyring (env vars still win when set)."""
+        data = load_settings()
+        self._apply_settings(data)
+        loaded_keys = []
+        if data.get("remember_keys"):
+            for prov, var in self.api_key_vars.items():
+                if not var.get():
+                    key = keyring_get_key(prov)
+                    if key:
+                        var.set(key)
+                        loaded_keys.append(prov)
+        if hasattr(self, "settings_status_lbl"):
+            if data:
+                msg = "Settings restored from last session."
+                if loaded_keys:
+                    msg += f" API keys loaded from the OS keyring for: {', '.join(loaded_keys)}."
+                self.settings_status_lbl.config(text=msg, foreground="green")
+
+    def save_settings_clicked(self):
+        try:
+            save_settings(self._settings_snapshot())
+        except Exception as e:
+            messagebox.showerror("Save Failed", f"Could not write {SETTINGS_PATH}:\n{e}")
+            return
+        msg = f"Settings saved to {SETTINGS_PATH}."
+        if self.remember_keys_var.get():
+            if not keyring_available():
+                msg += (" API keys were NOT stored: no usable OS keyring found "
+                        "(pip install keyring, and on Linux a Secret Service backend).")
+                self.settings_status_lbl.config(text=msg, foreground="#b5651d")
+                return
+            stored = []
+            for prov, var in self.api_key_vars.items():
+                try:
+                    keyring_set_key(prov, var.get().strip())
+                    if var.get().strip():
+                        stored.append(prov)
+                except Exception as e:
+                    msg += f" ({prov} key not stored: {e})"
+            if stored:
+                msg += f" API keys stored in the OS keyring for: {', '.join(stored)}."
+        self.settings_status_lbl.config(text=msg, foreground="green")
+
+    def forget_saved_keys(self):
+        removed = 0
+        for prov in self.api_key_vars:
+            try:
+                keyring_set_key(prov, "")
+                removed += 1
+            except Exception:
+                pass
+        self.remember_keys_var.set(False)
+        try:
+            save_settings(self._settings_snapshot())
+        except Exception:
+            pass
+        self.settings_status_lbl.config(text="Saved API keys removed from the OS keyring; 'remember keys' turned off.",
+                                        foreground="green")

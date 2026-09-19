@@ -2,7 +2,7 @@
 import os
 import json
 from ..deps import filedialog, messagebox, ttk
-from ..textutil import IOC_PATTERNS, csv_safe_cell, extract_iocs, extract_text_from_file, merge_iocs
+from ..textutil import IOC_PATTERNS, csv_safe_cell, extract_iocs, extract_text_from_file, merge_iocs, load_attack_techniques, attack_technique_name
 
 class IocsTabMixin:
     def _setup_iocs_tab(self):
@@ -25,11 +25,13 @@ class IocsTabMixin:
         mid = ttk.LabelFrame(self.tab_iocs, text="Extracted Indicators", padding=10)
         mid.pack(fill="both", expand=True, padx=10, pady=5)
 
-        self.ioc_tree = ttk.Treeview(mid, columns=("type", "indicator"), show="headings", selectmode="extended")
+        self.ioc_tree = ttk.Treeview(mid, columns=("type", "indicator", "detail"), show="headings", selectmode="extended")
         self.ioc_tree.heading("type", text="Type")
         self.ioc_tree.heading("indicator", text="Indicator")
-        self.ioc_tree.column("type", width=120, stretch=False)
-        self.ioc_tree.column("indicator", width=760)
+        self.ioc_tree.heading("detail", text="Detail (ATT&CK technique name / tactic)")
+        self.ioc_tree.column("type", width=110, stretch=False)
+        self.ioc_tree.column("indicator", width=420)
+        self.ioc_tree.column("detail", width=420)
         ioc_scroll = ttk.Scrollbar(mid, orient="vertical", command=self.ioc_tree.yview)
         self.ioc_tree.configure(yscrollcommand=ioc_scroll.set)
         self.ioc_tree.pack(side="left", fill="both", expand=True)
@@ -95,7 +97,12 @@ class IocsTabMixin:
         total = 0
         for category in IOC_PATTERNS:  # stable, sensible ordering
             for value in self.ioc_results.get(category, []):
-                self.ioc_tree.insert("", "end", values=(category, value))
+                detail = ""
+                if category == "mitre":
+                    info = load_attack_techniques().get(str(value).upper())
+                    if info:
+                        detail = info["name"] + (f"  [{', '.join(info['tactics'])}]" if info.get("tactics") else "")
+                self.ioc_tree.insert("", "end", values=(category, value, detail))
                 total += 1
         suffix = f" (from {source})" if source else ""
         self.ioc_count_lbl.config(text=f"{total} indicators{suffix}",
@@ -157,10 +164,11 @@ class IocsTabMixin:
                 return
             try:
                 with open(f, "w", encoding="utf-8", newline="") as fh:
-                    fh.write("type,indicator\n")
+                    fh.write("type,indicator,detail\n")
                     for category in IOC_PATTERNS:
                         for value in self.ioc_results.get(category, []):
-                            fh.write(f"{csv_safe_cell(category)},{csv_safe_cell(value)}\n")
+                            detail = attack_technique_name(value) if category == "mitre" else ""
+                            fh.write(f"{csv_safe_cell(category)},{csv_safe_cell(value)},{csv_safe_cell(detail)}\n")
                 messagebox.showinfo("Exported", f"IOCs saved to {os.path.basename(f)}")
             except Exception as e:
                 messagebox.showerror("Export Error", str(e))

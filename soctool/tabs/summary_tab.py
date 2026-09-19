@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 from ..deps import filedialog, messagebox, scrolledtext, tk, ttk
+from ..textutil import normalize_answer
 
 class SummaryTabMixin:
     def _setup_summary_tab(self):
@@ -42,10 +43,10 @@ class SummaryTabMixin:
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
 
-    def _open_remove_dialog(self, title, prompt, labels, on_remove_indices):
+    def _open_remove_dialog(self, title, prompt, labels, on_remove_indices, confirm_text=None):
         """Generic modal picker: an extended-select listbox of `labels`; calls
         on_remove_indices(sorted_selected_indices) on confirm. Shared by the
-        finding and hint removers."""
+        finding/hint removers and the run-hint / pivot pickers."""
         win = tk.Toplevel(self.root)
         win.title(title)
         win.geometry("640x400")
@@ -69,7 +70,9 @@ class SummaryTabMixin:
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill="x", padx=10, pady=10)
-        ttk.Button(btn_frame, text="Remove Selected", command=do_remove).pack(side="right")
+        if confirm_text is None:
+            confirm_text = "Remove Selected" if "remove" in title.lower() else "OK"
+        ttk.Button(btn_frame, text=confirm_text, command=do_remove).pack(side="right")
         ttk.Button(btn_frame, text="Cancel", command=win.destroy).pack(side="right", padx=5)
 
     def summary_remove_finding(self):
@@ -84,8 +87,12 @@ class SummaryTabMixin:
         def remove(idxs):
             remove_ids = {id(ordered[i]) for i in idxs}
             removed_titles = {ordered[i].get('title') for i in idxs}
+            removed_answers = {normalize_answer(ordered[i].get('flag_answer', '')) for i in idxs}
             self.verified_flags_data = [f for f in self.verified_flags_data if id(f) not in remove_ids]
             self.th_found_flags -= {t for t in removed_titles if t}
+            self.th_found_answers -= {a for a in removed_answers if a}
+            if hasattr(self, "timeline_refresh"):
+                self.timeline_refresh()
             for t in removed_titles:
                 if t:
                     self.th_log_history(f"[REMOVED] {t}")
@@ -106,9 +113,13 @@ class SummaryTabMixin:
 
         for idx, item in enumerate(sorted_flags, 1):
             txt += f"{idx}. FLAG: {item['title']}\n"
+            if item.get('flag_answer'):
+                txt += f"   ANSWER: {item['flag_answer']}\n"
             txt += f"   FOCUS: {item.get('focus_id', 'General')}\n"
             if item.get('source'):
                 txt += f"   SOURCE: {item['source']}\n"
+            if item.get('kql'):
+                txt += f"   KQL:   {str(item['kql']).strip().splitlines()[0][:120]}\n"
             txt += f"   NOTE:  {item['note']}\n"
             txt += "-"*50 + "\n"
 

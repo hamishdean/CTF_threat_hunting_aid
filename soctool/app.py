@@ -13,12 +13,14 @@ from .tabs.flagbank_tab import FlagBankTabMixin
 from .tabs.hunter_tab import HunterTabMixin
 from .tabs.soc_tab import SocTabMixin
 from .tabs.iocs_tab import IocsTabMixin
+from .tabs.results_tab import ResultsTabMixin
+from .tabs.timeline_tab import TimelineTabMixin
 from .tabs.summary_tab import SummaryTabMixin
 from .tabs.incident_tab import IncidentTabMixin
 from .tabs.session_tab import SessionTabMixin
 from .tabs.guide_tab import GuideTabMixin
 
-class UnifiedSOCTool(ConfigTabMixin, HintsTabMixin, FlagBankTabMixin, HunterTabMixin, SocTabMixin, IocsTabMixin, SummaryTabMixin, IncidentTabMixin, SessionTabMixin, GuideTabMixin):
+class UnifiedSOCTool(ConfigTabMixin, HintsTabMixin, FlagBankTabMixin, HunterTabMixin, SocTabMixin, ResultsTabMixin, TimelineTabMixin, IocsTabMixin, SummaryTabMixin, IncidentTabMixin, SessionTabMixin, GuideTabMixin):
     def __init__(self, root):
         self.root = root
         self.root.title("Unified SOC Analyst & Threat Hunter (CTF Edition)")
@@ -40,8 +42,14 @@ class UnifiedSOCTool(ConfigTabMixin, HintsTabMixin, FlagBankTabMixin, HunterTabM
         self.active_flag_var = tk.StringVar(value="General/All") # GLOBAL FLAG FOCUS
 
         self.th_files = []
-        self.th_found_flags = set()
-        self.verified_flags_data = [] # List of {title, description, note, focus_id}
+        self.th_found_flags = set()          # titles of verified findings
+        self.th_found_answers = set()        # normalized flag answers of verified findings
+        self.verified_flags_data = [] # List of {title, description, note, focus_id, flag_answer, kql, evidence, evidence_rows, source}
+        self.th_workers_var = tk.IntVar(value=3)   # parallel AI batches (both hunters)
+        self._th_worker_active = False       # a hunt is analysing pages in the background
+        self._th_candidate_shown = False     # the editor holds a candidate awaiting a decision
+        self._th_batches_done = 0
+        self._th_batches_total = 0
 
         self.th_candidate_queue = []
         self.th_pages_buffer = []
@@ -53,6 +61,13 @@ class UnifiedSOCTool(ConfigTabMixin, HintsTabMixin, FlagBankTabMixin, HunterTabM
 
         self.soc_memory = []
         self.soc_last_records = []
+        self.soc_last_kql = ""
+        self.known_tables = []               # [{TableName, Rows, Latest}] from List Tables
+        self.schema_cache = {}               # table -> [columns] (getschema)
+        self.soc_auto_retry_var = tk.IntVar(value=2)      # agent: auto-fix attempts on error / 0 rows
+        self.soc_suggest_var = tk.BooleanVar(value=True)  # agent: propose next pivots after a run
+        self.soc_suggestions = []            # [{question, why}] from the last run
+        self.soc_next_var = tk.StringVar(value="")
         self.soc_logger = None
         self.soc_model_var = tk.StringVar(value=DEFAULT_MODEL)
         self.last_kql = ""
@@ -72,6 +87,8 @@ class UnifiedSOCTool(ConfigTabMixin, HintsTabMixin, FlagBankTabMixin, HunterTabM
         # Off by default: don't write API keys into saved session files (they are
         # plaintext JSON). The analyst can opt in from the Session Manager tab.
         self.save_keys_var = tk.BooleanVar(value=False)
+        # Opt-in: keep API keys in the OS keyring between launches (Configuration tab).
+        self.remember_keys_var = tk.BooleanVar(value=False)
 
         self.ctf_hints = []
         self.hint_model_var = tk.StringVar(value=DEFAULT_MODEL)
@@ -97,6 +114,8 @@ How - How did this happen?
 Recommendations: (What steps should be taken to reduce risk or stop the activity?)
 """
         self._setup_ui()
+        # Restore provider/workspace/model choices (and keyring-held keys, if opted in).
+        self._load_saved_settings()
 
     def _setup_ui(self):
         # --- TOP BAR GLOBAL FOCUS ---
@@ -119,6 +138,8 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self.tab_hints = ttk.Frame(self.notebook)
         self.tab_hunter = ttk.Frame(self.notebook)
         self.tab_soc = ttk.Frame(self.notebook)
+        self.tab_results = ttk.Frame(self.notebook)
+        self.tab_timeline = ttk.Frame(self.notebook)
         self.tab_iocs = ttk.Frame(self.notebook) # NEW IOC EXTRACTOR
         self.tab_flag_bank = ttk.Frame(self.notebook) # NEW FLAG BANK
         self.tab_summary = ttk.Frame(self.notebook)
@@ -131,6 +152,8 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self.notebook.add(self.tab_hints, text="🧩 Flag Hints")
         self.notebook.add(self.tab_hunter, text="🕵️ Threat Hunter")
         self.notebook.add(self.tab_soc, text="🛡️ Azure SOC Agent")
+        self.notebook.add(self.tab_results, text="📊 Query Results")
+        self.notebook.add(self.tab_timeline, text="🕒 Timeline")
         self.notebook.add(self.tab_iocs, text="🧬 IOCs") # NEW
         self.notebook.add(self.tab_flag_bank, text="🏦 Flag Bank (Context)") # NEW
         self.notebook.add(self.tab_summary, text="🏆 Flag Summary")
@@ -143,6 +166,8 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self._setup_hints_tab()
         self._setup_hunter_tab()
         self._setup_soc_tab()
+        self._setup_results_tab()
+        self._setup_timeline_tab()
         self._setup_iocs_tab() # NEW
         self._setup_flag_bank_tab() # NEW
         self._setup_summary_tab()

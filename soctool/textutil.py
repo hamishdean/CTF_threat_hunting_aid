@@ -5,6 +5,7 @@ import os
 import re
 from typing import List
 from .deps import Document, HAS_DOCX, HAS_PYPDF, PdfReader
+import json
 
 def extract_text_from_file(filepath: str) -> List[str]:
     """Reads PDF, DOCX, or TXT files and returns a list of page strings (or chunks)."""
@@ -183,15 +184,16 @@ _TIMELINE_DESC_KEYS = ("title", "AlertName", "description", "Description", "mess
                        "flag_answer", "FlagAnswer", "ProcessCommandLine", "AccountName",
                        "DeviceName", "RemoteIP", "note")
 
-def build_timeline(events, max_events=100):
+def build_timeline(events, max_events=100, source=""):
     """Build a chronological timeline from records/findings (deterministic).
 
     `events` is an iterable of dicts (Azure log records, finding dicts, etc.).
     For each dict, use the first recognizable timestamp field (or any ISO-8601-ish
     timestamp found in its values) plus a short description. Returns a list of
-    (timestamp_string, description) tuples sorted ascending; rows with no
-    parseable timestamp are skipped. Gives the AI report a factual backbone
-    instead of relying on it to invent the order.
+    (timestamp_string, description, source) tuples sorted ascending; rows with no
+    parseable timestamp are skipped. `source` labels every row unless the event
+    carries its own "_source" key. Gives the AI report a factual backbone instead
+    of relying on it to invent the order.
     """
     rows = []
     for ev in events or []:
@@ -204,7 +206,7 @@ def build_timeline(events, max_events=100):
                 ts = str(ev[key])
                 break
         if not ts:
-            match = _TIMESTAMP_RE.search(" ".join(str(v) for v in ev.values()))
+            match = _TIMESTAMP_RE.search(" ".join(str(v) for k, v in ev.items() if k != "_source"))
             if match:
                 ts = match.group(0)
         if not ts:
@@ -216,9 +218,9 @@ def build_timeline(events, max_events=100):
                 desc = str(ev[key])
                 break
         if not desc:
-            desc = "; ".join(f"{k}={v}" for k, v in list(ev.items())[:4])
+            desc = "; ".join(f"{k}={v}" for k, v in list(ev.items()) if k != "_source")[:200]
 
-        rows.append((ts.strip(), desc.strip()[:200]))
+        rows.append((ts.strip(), desc.strip()[:200], str(ev.get("_source") or source)))
 
     # ISO-8601 strings sort chronologically as plain text.
     rows.sort(key=lambda r: r[0])
@@ -234,3 +236,72 @@ def csv_safe_cell(value):
     if s[:1] in ("=", "+", "-", "@", "\t", "\r"):
         s = "'" + s
     return '"' + s.replace('"', '""') + '"'
+
+# ------------------------------------------
+# FINDING DEDUPE
+# ------------------------------------------
+
+def normalize_answer(value):
+    """Canonical form of a flag answer for duplicate detection: refanged, trimmed,
+    unquoted, whitespace-collapsed, lower-cased. Two findings with the same
+    normalized answer are the same answer even if the AI titled them differently."""
+    if value is None:
+        return ""
+    s = refang(str(value)).strip().strip("\"'`").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()
+
+def rows_mentioning(records, value, limit=3):
+    """Return up to `limit` records whose stringified values contain `value`
+    (case-insensitive). Used to attach raw evidence rows to an AI finding."""
+    needle = normalize_answer(value)
+    if not needle or len(needle) < 2:
+        return []
+    hits = []
+    for r in records or []:
+        try:
+            blob = json.dumps(r, default=str).lower()
+        except Exception:
+            blob = str(r).lower()
+        if needle in blob:
+            hits.append(r)
+            if len(hits) >= limit:
+                break
+    return hits
+
+# ------------------------------------------
+# MITRE ATT&CK TECHNIQUE LOOKUP (bundled data, no network)
+# ------------------------------------------
+
+ATTACK_DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "data", "attack_techniques.json")
+_ATTACK_CACHE = None
+
+def load_attack_techniques():
+    """Return {technique_id: {"name": ..., "tactics": [...]}} from the bundled
+    data/attack_techniques.json (MITRE ATT&CK Enterprise). Empty dict if missing."""
+    global _ATTACK_CACHE
+    if _ATTACK_CACHE is None:
+        try:
+            with open(ATTACK_DATA_PATH, "r", encoding="utf-8") as fh:
+                _ATTACK_CACHE = json.load(fh).get("techniques", {})
+        except Exception:
+            _ATTACK_CACHE = {}
+    return _ATTACK_CACHE
+
+def attack_technique_name(technique_id):
+    """'T1059.001' -> 'Command and Scripting Interpreter: PowerShell' ('' if unknown)."""
+    info = load_attack_techniques().get(str(technique_id).upper().strip())
+    return info["name"] if info else ""
+
+def attack_label(technique_id, with_tactics=True):
+    """Human label for a technique id, e.g.
+    'T1059.001 - Command and Scripting Interpreter: PowerShell (Execution)'."""
+    tid = str(technique_id).upper().strip()
+    info = load_attack_techniques().get(tid)
+    if not info:
+        return tid
+    label = f"{tid} - {info['name']}"
+    if with_tactics and info.get("tactics"):
+        label += f" ({', '.join(info['tactics'])})"
+    return label

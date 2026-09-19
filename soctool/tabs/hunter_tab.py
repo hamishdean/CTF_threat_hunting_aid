@@ -8,6 +8,9 @@ from ..common import AzureSentinelFormatter
 from ..config import DEFAULT_MODEL, PROVIDER_DEFAULTS
 from ..deps import filedialog, messagebox, scrolledtext, simpledialog, tk, ttk
 from ..textutil import extract_text_from_file
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from ..prompts import FINDINGS_SCHEMA
+from ..textutil import normalize_answer
 
 class HunterTabMixin:
     def _setup_hunter_tab(self):
@@ -25,6 +28,10 @@ class HunterTabMixin:
         th_model_combo.pack(fill="x", pady=2)
         self._model_combos.append((self.th_model_var, th_model_combo))
 
+        workers_row = ttk.Frame(opts_frame)
+        workers_row.pack(fill="x", pady=2)
+        ttk.Label(workers_row, text="Parallel batches:").pack(side="left")
+        ttk.Spinbox(workers_row, from_=1, to=8, width=3, textvariable=self.th_workers_var).pack(side="left", padx=4)
         ttk.Button(opts_frame, text="Add Files...", command=self.th_add_files).pack(fill="x", pady=2)
         ttk.Button(opts_frame, text="Clear List", command=self.th_clear_files).pack(fill="x", pady=2)
         self.th_start_btn = ttk.Button(opts_frame, text="▶ START HUNT", command=self.th_start_hunt)
@@ -94,6 +101,8 @@ class HunterTabMixin:
         self.th_pages_buffer = []
         self.th_pages_source = []
         self._th_complete_logged = False
+        self._th_batches_done = 0
+        self._th_batches_total = 0
         self._ai_cancel_event.clear()
         self._set_ai_running(True)
         self.th_status_lbl.config(text="Reading files...")
@@ -139,90 +148,170 @@ class HunterTabMixin:
             self.root.after(0, lambda: self.th_status_lbl.config(text="Status: Idle"))
             self._set_ai_running(False)
 
-    def _th_process_batch_impl(self):
+    def _th_build_batches(self):
+        """Group pages into (start_idx, end_idx, text, source_label) batches under a
+        page and character budget, so nothing is skipped and no batch is huge."""
         PAGE_CAP = 4          # never send more than this many pages at once
         CHAR_BUDGET = 12000   # ...or more than roughly this many characters
         HARD_CAP = 20000      # absolute ceiling for a single oversized page
-
-        while self.th_current_idx < len(self.th_pages_buffer):
-            if self._ai_cancelled():
-                self.root.after(0, lambda: self.th_status_lbl.config(text="Hunt stopped by user."))
-                self._set_ai_running(False)
-                return
-
-            # Accumulate pages under a character budget, advancing the index only over
-            # pages actually included, so nothing is silently skipped (I5).
-            start_idx = self.th_current_idx
-            parts = []
-            chars = 0
-            while self.th_current_idx < len(self.th_pages_buffer):
-                page = self.th_pages_buffer[self.th_current_idx]
+        batches = []
+        idx = self.th_current_idx
+        n = len(self.th_pages_buffer)
+        while idx < n:
+            start = idx
+            parts, chars = [], 0
+            while idx < n:
+                page = self.th_pages_buffer[idx]
                 if parts and (chars + len(page) > CHAR_BUDGET or len(parts) >= PAGE_CAP):
                     break
                 parts.append(page)
                 chars += len(page)
-                self.th_current_idx += 1
-            batch_text = "\n".join(parts)[:HARD_CAP]
+                idx += 1
+            src = self.th_pages_source[start:idx]
+            label = "" if not src else (src[0] if src[0] == src[-1] else f"{src[0]} … {src[-1]}")
+            batches.append((start, idx, "\n".join(parts)[:HARD_CAP], label))
+        return batches
 
-            # Provenance label for this batch (E6): a single "<file> p<N>" or a range.
-            src_slice = self.th_pages_source[start_idx:self.th_current_idx]
-            if not src_slice:
-                source_label = ""
-            elif src_slice[0] == src_slice[-1]:
-                source_label = src_slice[0]
-            else:
-                source_label = f"{src_slice[0]} … {src_slice[-1]}"
-
-            # Show progress like the SOC batch loop (E-F).
-            self.root.after(0, lambda a=start_idx + 1, b=self.th_current_idx, n=len(self.th_pages_buffer):
-                            self.th_status_lbl.config(text=f"Analyzing pages {a}-{b} of {n}..."))
-
-            try:
-                model = self.th_model_var.get()
-
-                # USE ACTIVE HINTS
-                active_hints = self.get_active_hints()
-                current_focus = self.active_flag_var.get()
-
-                hints_ctx = ""
-                if active_hints:
-                    hints_ctx = f"CTF HINTS (FOCUS: {current_focus}):\n" + "\n".join([f"[{h.get('id','?')}] {h['hint']}" for h in active_hints])
-
-                prompt = f"""You are a CTF Flag Hunter. Analyze this log excerpt.
+    def _th_analyze_batch(self, batch_text, source_label, hints_ctx, model, provider, api_key):
+        """One AI call for one batch. Returns the list of finding dicts (may be empty)."""
+        prompt = f"""You are a CTF Flag Hunter. Analyze this log excerpt.
 Your goal is to find the EXACT FLAG ANSWER - the specific value, string, artifact, IP, username, hash, or flag{{...}} that answers the CTF challenge or investigation question.
 
 {hints_ctx}
-Already found (ignore these): {json.dumps(list(self.th_found_flags))}
+Already found (ignore these titles): {json.dumps(list(self.th_found_flags))}
+Already found answer values (do not report again): {json.dumps(sorted(self.th_found_answers)[:50])}
 
 IMPORTANT: Do NOT just describe threats generically. Extract the EXACT answer value.
-Return JSON: {{ "findings": [ {{ "title": "short name", "description": "why this is the answer", "flag_answer": "THE EXACT VALUE e.g. flag{{abc123}} or 192.168.1.5 or malware.exe", "severity": "High", "evidence": "raw log line proving it" }} ] }}
+Return JSON: {{ "findings": [ {{ "title": "short name", "description": "why this is the answer", "flag_answer": "THE EXACT VALUE e.g. flag{{abc123}} or 192.168.1.5 or malware.exe", "severity": "High", "confidence": "High", "evidence": "raw log line proving it", "log_lines": [] }} ] }}
 If no flags found, return: {{ "findings": [] }}
 
 LOGS:
 {batch_text}"""
-                content = ai_chat_completion(
-                    self._get_provider(), self._get_api_key(), model,
-                    [{"role": "user", "content": prompt}], json_mode=True
-                )
-                data = parse_ai_json(content)
-                findings = data.get("findings", [])
-                for f in findings:
-                    if f.get("title") not in self.th_found_flags:
-                        f["source"] = source_label
-                        self.th_candidate_queue.append(f)
+        content = ai_chat_completion(
+            provider, api_key, model,
+            [{"role": "user", "content": prompt}], json_mode=True, json_schema=FINDINGS_SCHEMA
+        )
+        findings = parse_ai_json(content).get("findings", [])
+        out = []
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            f["source"] = source_label
+            # Keep the raw lines that mention the answer as evidence rows.
+            ans = f.get("flag_answer", "")
+            if ans and not f.get("evidence_rows"):
+                f["evidence_rows"] = [ln for ln in batch_text.splitlines()
+                                      if normalize_answer(ans) and normalize_answer(ans) in ln.lower()][:3]
+            out.append(f)
+        return out
+
+    def _th_offer_candidates(self, findings):
+        """Queue new findings for review, dropping duplicates by title or by the
+        normalized answer (already verified, or already queued). Thread-safe enough:
+        called from worker threads; list/set ops are atomic under the GIL."""
+        added = 0
+        queued_answers = {normalize_answer(c.get("flag_answer", "")) for c in self.th_candidate_queue}
+        for f in findings:
+            title = f.get("title", "")
+            ans = normalize_answer(f.get("flag_answer", ""))
+            if title in self.th_found_flags:
+                continue
+            if ans and (ans in self.th_found_answers or ans in queued_answers):
+                continue
+            queued_answers.add(ans)
+            self.th_candidate_queue.append(f)
+            added += 1
+        if added:
+            self.root.after(0, self._th_on_candidates_added)
+        return added
+
+    def _th_on_candidates_added(self):
+        """UI thread: show the next candidate if the analyst isn't already looking at one."""
+        if not self._th_candidate_shown:
+            self.th_show_candidate()
+        else:
+            self._th_update_status()
+
+    def _th_update_status(self, text=None):
+        pending = len(self.th_candidate_queue)
+        if text is None:
+            if self._th_worker_active:
+                text = f"Analyzing batch {self._th_batches_done}/{self._th_batches_total}..."
+            elif self._th_candidate_shown:
+                text = "Waiting for Verification..."
+            else:
+                text = "Status: Idle"
+        if pending:
+            text += f"  |  {pending} candidate(s) pending review"
+        self.th_status_lbl.config(text=text)
+
+    def _th_process_batch_impl(self):
+        """Analyse every remaining batch on a bounded thread pool. Candidates are
+        queued as they arrive and the analyst reviews them while the AI keeps going,
+        instead of the hunt pausing on every finding."""
+        batches = self._th_build_batches()
+        if not batches:
+            self._set_ai_running(False)
+            self.root.after(0, self.th_show_candidate)
+            return
+
+        # Read every Tk variable here, on the hunt thread, so pool threads never touch Tk.
+        model = self.th_model_var.get()
+        provider = self._get_provider()
+        api_key = self._get_api_key()
+        active_hints = self.get_active_hints()
+        current_focus = self.active_flag_var.get()
+        hints_ctx = ""
+        if active_hints:
+            hints_ctx = f"CTF HINTS (FOCUS: {current_focus}):\n" + "\n".join(
+                [f"[{h.get('id', '?')}] {h['hint']}" for h in active_hints])
+
+        try:
+            workers = max(1, min(8, int(self.th_workers_var.get())))
+        except Exception:
+            workers = 3
+        self._th_worker_active = True
+        self._th_batches_total = len(batches)
+        self._th_batches_done = 0
+        self.root.after(0, self._th_update_status)
+
+        def run_one(b):
+            start, end, text, label = b
+            if self._ai_cancelled():
+                return start, end, None, None
+            try:
+                return start, end, self._th_analyze_batch(text, label, hints_ctx, model, provider, api_key), None
             except Exception as e:
-                err = f"[!] Analysis error on pages {start_idx + 1}-{self.th_current_idx}: {e}"
-                self.root.after(0, lambda m=err: self.th_log_history(m))
+                return start, end, None, e
 
-            # Pause for human review as soon as we have something to show (B1).
-            if self.th_candidate_queue:
-                self.root.after(0, self.th_show_candidate)
-                return
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = []
+                for b in batches:
+                    if self._ai_cancelled():
+                        break
+                    futures.append(pool.submit(run_one, b))
+                for fut in as_completed(futures):
+                    start, end, findings, err = fut.result()
+                    self._th_batches_done += 1
+                    # Pages up to the furthest completed batch count as processed.
+                    self.th_current_idx = max(self.th_current_idx, end)
+                    if err is not None:
+                        msg = f"[!] Analysis error on pages {start + 1}-{end}: {err}"
+                        self.root.after(0, lambda m=msg: self.th_log_history(m))
+                    elif findings:
+                        self._th_offer_candidates(findings)
+                    self.root.after(0, self._th_update_status)
+        finally:
+            self._th_worker_active = False
+            self._set_ai_running(False)
 
-        # All pages processed with nothing pending: hand off so completion is reported
-        # exactly once (queue is empty here, so th_show_candidate finishes the hunt).
-        self._set_ai_running(False)
-        self.root.after(0, self.th_show_candidate)
+        if self._ai_cancelled():
+            self.root.after(0, lambda: self._th_update_status("Hunt stopped by user."))
+        else:
+            self.th_current_idx = len(self.th_pages_buffer)
+        # Hand off so completion is reported exactly once via th_show_candidate.
+        self.root.after(0, self._th_on_candidates_added)
 
     def th_show_candidate(self):
         # Show the next queued candidate if there is one.
@@ -231,10 +320,19 @@ LOGS:
             formatted = AzureSentinelFormatter.format_log(finding)
             self.th_editor.delete("1.0", "end")
             self.th_editor.insert("1.0", formatted)
-            self.th_status_lbl.config(text="Waiting for Verification...")
+            self._th_candidate_shown = True
+            self._th_update_status("Waiting for Verification...")
             return
 
-        # Queue empty: resume processing only if pages remain and we weren't stopped.
+        self._th_candidate_shown = False
+
+        # Queue empty but the AI is still analysing: just say so.
+        if self._th_worker_active:
+            self._th_update_status()
+            return
+
+        # Queue empty: resume processing only if pages remain and we weren't stopped
+        # (e.g. the worker died before finishing).
         if self.th_current_idx < len(self.th_pages_buffer) and not self._ai_cancelled():
             self._set_ai_running(True)
             threading.Thread(target=self.th_process_batch_thread, daemon=True).start()
@@ -269,6 +367,7 @@ LOGS:
         formatted = AzureSentinelFormatter.format_log(finding)
         self.th_editor.delete("1.0", "end")
         self.th_editor.insert("1.0", formatted)
+        self._th_candidate_shown = True
         self.th_status_lbl.config(text="Waiting for Verification of Manual Entry...")
 
     def th_verify(self):
@@ -299,17 +398,19 @@ LOGS:
 
         evidence = data.get("Evidence", str(data))
         source = data.get("Source", "")
+        kql = data.get("KQL", "") or ""
+        evidence_rows = data.get("EvidenceRows", []) or []
 
         # Draft the note off the UI thread so the app stays responsive (B2).
         self._th_verifying = True
         self.th_status_lbl.config(text="Drafting Flag Note (AI)...")
         threading.Thread(
             target=self._th_note_thread,
-            args=(title, description, flag_answer, focus_id, relevant_hint, evidence, source),
+            args=(title, description, flag_answer, focus_id, relevant_hint, evidence, source, kql, evidence_rows),
             daemon=True,
         ).start()
 
-    def _th_note_thread(self, title, description, flag_answer, focus_id, relevant_hint, evidence, source):
+    def _th_note_thread(self, title, description, flag_answer, focus_id, relevant_hint, evidence, source, kql="", evidence_rows=None):
         suggested_note = ""
         try:
             if not self._get_api_key():
@@ -342,12 +443,15 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         # Hand back to the UI thread to show the dialog and save. Guard the handoff so
         # a failure here can't leave the Verify button permanently wedged.
         try:
-            self.root.after(0, lambda: self._th_finish_verify(title, description, focus_id, suggested_note, source))
+            self.root.after(0, lambda: self._th_finish_verify(
+                title, description, focus_id, suggested_note, source,
+                flag_answer=flag_answer, kql=kql, evidence=evidence, evidence_rows=evidence_rows or []))
         except Exception as e:
             print(f"Verify handoff error: {e}")
             self._th_verifying = False
 
-    def _th_finish_verify(self, title, description, focus_id, suggested_note, source=""):
+    def _th_finish_verify(self, title, description, focus_id, suggested_note, source="",
+                          flag_answer="", kql="", evidence="", evidence_rows=None):
         try:
             self.th_status_lbl.config(text="Status: Idle")
             note = simpledialog.askstring(
@@ -361,15 +465,28 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
                 note = "No specific note provided."
 
             self.th_found_flags.add(title)
-            self.th_log_history(f"[FLAG] {title}")
+            if normalize_answer(flag_answer):
+                self.th_found_answers.add(normalize_answer(flag_answer))
+            self.th_log_history(f"[FLAG] {title}" + (f" -> {flag_answer}" if flag_answer else ""))
             self.verified_flags_data.append({
                 "title": title,
                 "description": description,
                 "note": note,
                 "focus_id": focus_id,
                 "source": source,
+                "flag_answer": flag_answer,
+                "kql": kql,
+                "evidence": evidence if isinstance(evidence, str) else json.dumps(evidence, default=str),
+                "evidence_rows": list(evidence_rows or [])[:5],
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
             })
             self._update_summary_display()
+            self._th_candidate_shown = False
+            # Drop any queued duplicates of the answer just confirmed.
+            self.th_candidate_queue = [c for c in self.th_candidate_queue
+                                       if normalize_answer(c.get("flag_answer", "")) not in self.th_found_answers]
+            if hasattr(self, "timeline_refresh"):
+                self.timeline_refresh()
 
             # --- OPTIONAL AUTO-REFRESH (off by default) ---
             # Regenerating the full Incident Report and Flag Bank narrative on every
@@ -387,4 +504,5 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         if self._th_verifying:
             return  # don't discard while a note is drafting for the current candidate
         self.th_editor.delete("1.0", "end")
+        self._th_candidate_shown = False
         self.th_show_candidate()

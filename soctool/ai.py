@@ -3,7 +3,9 @@
 import json
 import time
 from .deps import GEMINI_SDK, HAS_ANTHROPIC, HAS_GEMINI, HAS_OPENAI, OpenAI, anthropic, genai, google_genai, google_genai_types, pd
-from .prompts import SYSTEM_PROMPT_KQL_GENERATOR, SYSTEM_PROMPT_THREAT_HUNT, THREAT_HUNT_PROMPTS, THREAT_HUNT_PROMPT_DEFAULT
+from .prompts import (SYSTEM_PROMPT_KQL_GENERATOR, SYSTEM_PROMPT_THREAT_HUNT, THREAT_HUNT_PROMPTS,
+                      THREAT_HUNT_PROMPT_DEFAULT, FINDINGS_SCHEMA, KQL_SCHEMA, NEXT_STEPS_SCHEMA,
+                      SYSTEM_PROMPT_NEXT_STEPS, SYSTEM_PROMPT_KQL_FIX)
 
 def _is_transient_error(exc):
     """True if an AI API error looks worth retrying (rate limit, 5xx, connection)."""
@@ -31,7 +33,26 @@ def call_with_retry(fn, attempts=3, base_delay=1.0):
             time.sleep(base_delay * (2 ** i))
     raise last
 
-def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_tokens=4096, temperature=None):
+def _looks_like_schema_rejection(exc):
+    """True when a provider refused a structured-output schema (rather than failing
+    for an unrelated reason), so the caller can retry in plain JSON mode."""
+    msg = str(exc).lower()
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status not in (None, 400, 422):
+        return False
+    return any(k in msg for k in ("response_format", "json_schema", "schema", "structured output",
+                                  "invalid_request", "unsupported", "not supported"))
+
+def _schema_for_gemini(schema):
+    """Gemini's JSON-schema support is a subset of OpenAI's; strip the keys it does
+    not accept so the same schema definition serves both providers."""
+    if isinstance(schema, dict):
+        return {k: _schema_for_gemini(v) for k, v in schema.items() if k not in ("additionalProperties",)}
+    if isinstance(schema, list):
+        return [_schema_for_gemini(v) for v in schema]
+    return schema
+
+def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_tokens=4096, temperature=None, json_schema=None):
     """Unified AI completion wrapper supporting OpenAI, Gemini, and Claude.
 
     Args:
@@ -42,6 +63,9 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
         json_mode: If True, request JSON output
         max_tokens: Maximum tokens in response
         temperature: Optional temperature override
+        json_schema: Optional {"name":..., "schema": {...}} (see prompts.py). Implies
+            json_mode. OpenAI and Gemini enforce it server-side; if the model rejects
+            the schema the call is retried in plain JSON mode; Claude sees it as text.
 
     Returns:
         Response content as a string
@@ -51,7 +75,10 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
             raise ImportError("openai package not installed. Run: pip install openai")
         client = OpenAI(api_key=api_key)
         kwargs = {"model": model, "messages": messages}
-        if json_mode:
+        if json_schema:
+            kwargs["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": json_schema["name"], "schema": json_schema["schema"], "strict": True}}
+        elif json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         # Newer OpenAI reasoning models (o-series, gpt-5) require
         # max_completion_tokens and only accept the default temperature.
@@ -61,7 +88,14 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
             kwargs[token_param] = max_tokens
         if temperature is not None and not needs_completion_tokens:
             kwargs["temperature"] = temperature
-        response = call_with_retry(lambda: client.chat.completions.create(**kwargs))
+        try:
+            response = call_with_retry(lambda: client.chat.completions.create(**kwargs))
+        except Exception as e:
+            if not (json_schema and _looks_like_schema_rejection(e)):
+                raise
+            # Older/other models don't do strict schemas: fall back to plain JSON mode.
+            kwargs["response_format"] = {"type": "json_object"}
+            response = call_with_retry(lambda: client.chat.completions.create(**kwargs))
         # content is None when a reasoning model hits the token cap before
         # emitting text; return "" so callers/parse_ai_json fail cleanly.
         return response.choices[0].message.content or ""
@@ -78,8 +112,10 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
                 system_text += msg["content"] + "\n"
             else:
                 user_messages.append(msg)
-        if json_mode:
+        if json_mode or json_schema:
             system_text += "\nYou MUST return valid JSON only. No extra text outside the JSON object."
+        if json_schema:
+            system_text += "\nThe JSON MUST match this schema exactly:\n" + json.dumps(json_schema["schema"])
         if not user_messages:
             user_messages = [{"role": "user", "content": "Please proceed."}]
         kwargs = {
@@ -121,8 +157,10 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
             cfg = {}
             if system_text:
                 cfg["system_instruction"] = system_text
-            if json_mode:
+            if json_mode or json_schema:
                 cfg["response_mime_type"] = "application/json"
+            if json_schema:
+                cfg["response_json_schema"] = _schema_for_gemini(json_schema["schema"])
             if temperature is not None:
                 cfg["temperature"] = temperature
             if max_tokens:
@@ -131,9 +169,18 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
                 google_genai_types.Content(role=role, parts=[google_genai_types.Part.from_text(text=text)])
                 for role, text in turns
             ]
-            response = call_with_retry(lambda: client.models.generate_content(
-                model=model, contents=contents,
-                config=google_genai_types.GenerateContentConfig(**cfg) if cfg else None))
+
+            def _gen(c):
+                return client.models.generate_content(
+                    model=model, contents=contents,
+                    config=google_genai_types.GenerateContentConfig(**c) if c else None)
+            try:
+                response = call_with_retry(lambda: _gen(cfg))
+            except Exception as e:
+                if not (json_schema and _looks_like_schema_rejection(e)):
+                    raise
+                cfg.pop("response_json_schema", None)
+                response = call_with_retry(lambda: _gen(cfg))
             # .text is None (with a warning) when the reply had no text part.
             try:
                 return response.text or ""
@@ -143,7 +190,7 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
         # Legacy google-generativeai path.
         genai.configure(api_key=api_key)
         gen_config = {}
-        if json_mode:
+        if json_mode or json_schema:
             gen_config["response_mime_type"] = "application/json"
         if temperature is not None:
             gen_config["temperature"] = temperature
@@ -224,7 +271,10 @@ def parse_ai_json(content):
         snippet = " ".join(content.split())[:200]
         raise ValueError(f"AI did not return valid JSON. Response was: {snippet}")
 
-def get_query_context(provider, api_key, user_input, model, history=None, hints=None, active_focus="General/All", incident_context=""):
+def get_query_context(provider, api_key, user_input, model, history=None, hints=None, active_focus="General/All", incident_context="", schema_text=""):
+    """Ask the AI for a KQL query. `schema_text` (from azure_la.format_schema) lists
+    the tables/columns that really exist in the workspace so the model stops
+    inventing them."""
     # Keep context concise to avoid confusing the KQL generator
     hist_str = ""
     if history:
@@ -249,13 +299,15 @@ def get_query_context(provider, api_key, user_input, model, history=None, hints=
         user_msg = f"{inc_str}\n{user_msg}"
     if hist_str:
         user_msg = f"{hist_str}\n{user_msg}"
+    if schema_text:
+        user_msg = f"WORKSPACE SCHEMA (tables with data and their real columns):\n{schema_text[:6000]}\n\n{user_msg}"
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT_KQL_GENERATOR},
         {"role": "user", "content": user_msg}
     ]
     try:
-        content = ai_chat_completion(provider, api_key, model, messages, json_mode=True)
+        content = ai_chat_completion(provider, api_key, model, messages, json_mode=True, json_schema=KQL_SCHEMA)
         query_context = parse_ai_json(content)
 
         # UPDATED: Clean parameters like EXECUTOR.py
@@ -269,7 +321,7 @@ def get_query_context(provider, api_key, user_input, model, history=None, hints=
         params = query_context.get("parameters", {})
         try:
             # Flatten time range
-            raw_hours = params.get("time_range_hours", 8760)
+            raw_hours = query_context.get("time_range_hours") or params.get("time_range_hours", 8760)
             query_context["time_range_hours"] = int(str(raw_hours).lower().replace("hours","").replace("hour","").strip())
         except (ValueError, AttributeError):
             query_context["time_range_hours"] = 8760
@@ -284,7 +336,7 @@ def get_query_context(provider, api_key, user_input, model, history=None, hints=
     except Exception as e:
         return {"table_name": "Error", "kql_query": "", "error": str(e)}
 
-def hunt_on_records(provider, api_key, records, table_name, model, hints=None, found_flags=None, active_focus="General/All"):
+def hunt_on_records(provider, api_key, records, table_name, model, hints=None, found_flags=None, active_focus="General/All", found_answers=None):
     try:
         df = pd.DataFrame(records)
         csv_data = df.to_csv(index=False)
@@ -301,6 +353,8 @@ def hunt_on_records(provider, api_key, records, table_name, model, hints=None, f
         context_str += f"CTF HINTS (FOCUS: {active_focus}):\n" + "\n".join([f"- [{h.get('id', 'General')}] {h['hint']}" for h in hints]) + "\n"
     if found_flags:
         context_str += "ALREADY FOUND FLAGS (Ignore these):\n" + json.dumps(list(found_flags)) + "\n"
+    if found_answers:
+        context_str += "ALREADY FOUND ANSWER VALUES (do not report these again):\n" + json.dumps(list(found_answers)[:50]) + "\n"
 
     specific_instructions = THREAT_HUNT_PROMPTS.get(table_name, THREAT_HUNT_PROMPT_DEFAULT)
 
@@ -313,7 +367,51 @@ LOG DATA:
 
     try:
         messages = [SYSTEM_PROMPT_THREAT_HUNT, {"role": "user", "content": prompt}]
-        content = ai_chat_completion(provider, api_key, model, messages, json_mode=True)
-        return parse_ai_json(content).get("findings", [])
+        content = ai_chat_completion(provider, api_key, model, messages, json_mode=True, json_schema=FINDINGS_SCHEMA)
+        findings = parse_ai_json(content).get("findings", [])
+        return [f for f in findings if isinstance(f, dict)]
     except Exception as e:
         raise e
+
+def fix_kql(provider, api_key, model, kql, error, schema_text=""):
+    """Ask the AI to repair a failed / empty query. Returns (fixed_kql, explanation)."""
+    prompt = f"""Failed Query:
+{kql}
+
+Error Message / Issue:
+{error}
+"""
+    if schema_text:
+        prompt += f"\nWORKSPACE SCHEMA (real tables and columns):\n{schema_text[:6000]}\n"
+    messages = [{"role": "system", "content": SYSTEM_PROMPT_KQL_FIX}, {"role": "user", "content": prompt}]
+    content = ai_chat_completion(provider, api_key, model, messages, json_mode=True)
+    data = parse_ai_json(content)
+    return sanitize_kql(data.get("fixed_kql", "") or ""), data.get("explanation", "")
+
+def suggest_next_steps(provider, api_key, model, goal, kql, records, findings, incident_context="", hints=None):
+    """Ask the AI what to query next. Returns (assessment, [ {question, why}, ... ])."""
+    sample = ""
+    if records:
+        try:
+            sample = json.dumps(records[:8], default=str)[:4000]
+        except Exception:
+            sample = str(records[:8])[:4000]
+    finds = "\n".join(f"- {f.get('title', '')}: {f.get('flag_answer', '')}" for f in (findings or [])[:10])
+    hint_txt = "\n".join(f"- {h.get('hint', '')[:120]}" for h in (hints or [])[:5])
+    user = f"""Investigation goal: {goal}
+Query just run:
+{kql}
+Rows returned: {len(records or [])}
+Sample rows: {sample or '(none)'}
+Findings so far:
+{finds or '(none)'}
+Hints in play:
+{hint_txt or '(none)'}
+Incident context:
+{(incident_context or '')[:800]}
+"""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT_NEXT_STEPS}, {"role": "user", "content": user}]
+    content = ai_chat_completion(provider, api_key, model, messages, json_mode=True, json_schema=NEXT_STEPS_SCHEMA, max_tokens=800)
+    data = parse_ai_json(content)
+    suggestions = [s for s in data.get("suggestions", []) if isinstance(s, dict) and s.get("question")]
+    return data.get("assessment", ""), suggestions[:4]

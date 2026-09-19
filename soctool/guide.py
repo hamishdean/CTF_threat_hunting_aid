@@ -73,7 +73,12 @@ FIRST LAUNCH
   - Optional: paste the Azure Tenant ID that owns the workspace.
   - Click "Test Azure Connection". Green = signed in and the workspace answered.
     Red = a one-line explanation of what to fix (sign-in, wrong ID, missing role).
-  - These credentials are NOT saved to disk unless you use Session Manager.
+  - Click "Save Settings" (Remember Settings box) so provider, models, workspace,
+    tenant and agent options come back on the next launch. Tick "Remember API
+    keys in the OS keyring" to keep keys too - they go to the OS keyring
+    (Credential Manager / Keychain / Secret Service), never into a plain file.
+    "Forget Saved Keys" removes them again.
+  - Session Manager files never contain keys unless you opt in there.
   - Tip: API keys can be set via environment variables:
     OPENAI_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY
 
@@ -106,14 +111,21 @@ FIRST LAUNCH
   security threats, flags, and suspicious activity.
 
   HOW TO USE:
-  1. Click "Add Files" and select one or more supported files.
-  2. Choose an AI model.
+  1. Click "Add Files" and select one or more supported files
+     (PDF, DOCX, TXT, LOG, JSONL, JSON, CSV).
+  2. Choose an AI model and how many batches to analyse in parallel
+     ("Parallel batches", default 3 - also used by the SOC Agent).
   3. Click "START HUNT".
-  4. The AI reads the files in batches and looks for threats.
-  5. When a finding is discovered, it appears in the "Potential Flag" editor:
+  4. The AI reads the files in batches and looks for threats. It keeps going
+     while you review: the status line shows "N candidate(s) pending review".
+  5. When a finding is discovered, it appears in the "Potential Flag" editor
+     together with its provenance (file + page, or the KQL and raw rows that
+     produced it):
      - Click "Verify & Save" to confirm and save the finding.
      - Click "Discard" to skip it.
-  6. Verified findings are added to the Flag Summary instantly.
+  6. Verified findings are added to the Flag Summary and Timeline instantly.
+     A candidate whose answer value matches one you already verified is dropped
+     automatically, even if the AI gave it a different title.
 
   AUTO-REFRESH: By default, verifying a flag does NOT regenerate the Incident
   Report or Flag Bank narrative (those cost API calls and overwrite manual
@@ -136,17 +148,28 @@ FIRST LAUNCH
      "Show process executions on device WKS01"
      "Search for PowerShell activity across all devices"
   2. Click "Run AI Investigation":
-     - AI generates a KQL query.
+     - AI generates a KQL query (using the real workspace schema if you have
+       clicked "List Tables").
      - Query runs against Azure Log Analytics (up to 1 year of data).
-     - Results are analyzed for threats automatically.
-     - Findings are pushed to the Threat Hunter for verification.
+     - If it fails or returns nothing, the agent asks the AI for a fix and
+       re-runs it, up to the number of times set in the "Agent" row.
+     - Rows appear in the "Query Results" tab; they are analysed for flags in
+       parallel batches and findings go to the Threat Hunter for verification.
+     - The agent then proposes next pivots. Pick one in the "Next" box and
+       press "Run Suggested" to continue the hunt.
   3. Click "Stop AI" at any time to halt a running investigation.
+
+  AGENT ROW (under the prompt):
+  - "auto-fix failed/empty queries up to N times": 0 disables the retries.
+  - "suggest next pivots after each run": untick to save API calls.
 
   OTHER BUTTONS:
   - "Generate KQL Only": See the AI-generated query without running it.
   - "Open Manual KQL Editor": Write and execute your own KQL query directly.
   - "List Tables": Show every table that has data in the last year, with row
-    counts. Name one of them in your prompt to steer the AI's KQL.
+    counts, then fetch each table's columns (getschema). From then on the KQL
+    generator and Self-Heal only use tables and columns that really exist.
+    Run it once per workspace; the schema is saved with the session.
   - "Export Log to File": Save the console output to a .txt file.
   - "Self-Heal Last KQL": If a query fails, the AI attempts to fix and
     re-run it automatically.
@@ -174,6 +197,24 @@ FIRST LAUNCH
 
 
 --------------------------------------------------------------------------------
+2d.0 QUERY RESULTS AND TIMELINE TABS
+--------------------------------------------------------------------------------
+  QUERY RESULTS shows the rows the last query returned (also the table list):
+  - Click a column header to sort; type in Filter and press Apply/Enter.
+  - "View Row" (or double-click) shows the full record as JSON.
+  - "Copy Selected" copies rows as JSON lines.
+  - "Send Selected to Threat Hunter" saves the rows to a JSONL capture and adds
+    it to the hunter's file list, for a focused AI pass on just those rows.
+  - "Pivot on Cell Value..." turns a value from the selected row (a device,
+    account, IP, hash) into a SOC Agent question.
+  - "Export CSV" / "Export JSON" save the visible rows.
+
+  TIMELINE lists verified findings (red) and the latest query results in
+  timestamp order. Untick "include query results" to see findings only.
+  The same list is fed to the Incident Report Generator as the factual
+  backbone of its timeline. "Export CSV" / "Copy" for your own notes.
+
+--------------------------------------------------------------------------------
 2d.1 IOC EXTRACTOR TAB
 --------------------------------------------------------------------------------
   PURPOSE: Pull indicators of compromise out of your data with no AI/API calls.
@@ -183,7 +224,8 @@ FIRST LAUNCH
   HOW TO USE:
   1. Load files in the Threat Hunter tab (or accumulate findings / SOC results).
   2. Click "Extract from Loaded Files" or "Extract from Findings & Logs".
-  3. Review the categorized indicators in the table.
+  3. Review the categorized indicators in the table. MITRE technique IDs show
+     their technique name and tactic (from the bundled ATT&CK catalogue).
   4. Select one or more indicators, then:
      - "Pivot Selected -> SOC Agent" prefills a hunt query for those IOCs.
      - "Copy Selected" copies them to the clipboard.

@@ -3,6 +3,7 @@ import os
 import json
 from ..config import DEFAULT_MODEL
 from ..deps import filedialog, messagebox, ttk
+from ..textutil import normalize_answer
 
 class SessionTabMixin:
     def _setup_session_tab(self):
@@ -51,6 +52,7 @@ class SessionTabMixin:
             "hunter": {
                 "files": self.th_files,
                 "found_flags": list(self.th_found_flags),
+                "found_answers": sorted(self.th_found_answers),
                 "model": self.th_model_var.get(),
                 "history_text": self.th_history.get("1.0", "end"),
                 "verified_data": self.verified_flags_data # Save verified data
@@ -58,7 +60,14 @@ class SessionTabMixin:
             "soc": {
                 "memory": self.soc_memory,
                 "model": self.soc_model_var.get(),
-                "console_text": self.soc_console.get("1.0", "end")
+                "console_text": self.soc_console.get("1.0", "end"),
+                # Latest result set (capped) so the Results/Timeline tabs and the
+                # report have data straight after a reload.
+                "last_kql": self.soc_last_kql,
+                "last_records": json.loads(json.dumps(self.soc_last_records[:2000], default=str)),
+                "known_tables": self.known_tables,
+                "schema_cache": self.schema_cache,
+                "suggestions": self.soc_suggestions,
             },
             "reporter": self.reporter.get_state(),
             "incident": {
@@ -127,6 +136,10 @@ class SessionTabMixin:
                 for file_path in self.th_files: self.file_listbox.insert("end", os.path.basename(file_path))
                 self.th_found_flags = set(data["hunter"].get("found_flags", []))
                 self.verified_flags_data = data["hunter"].get("verified_data", []) # Load verified data
+                # Rebuild the answer set from the findings (older sessions lack it).
+                self.th_found_answers = set(data["hunter"].get("found_answers", [])) | {
+                    normalize_answer(f.get("flag_answer", "")) for f in self.verified_flags_data
+                    if normalize_answer(f.get("flag_answer", ""))}
                 self.th_model_var.set(data["hunter"].get("model", DEFAULT_MODEL))
                 self.th_history.config(state="normal")
                 self.th_history.delete("1.0", "end")
@@ -141,6 +154,15 @@ class SessionTabMixin:
                 self.soc_console.delete("1.0", "end")
                 self.soc_console.insert("1.0", data["soc"].get("console_text", ""))
                 self.soc_console.config(state="disabled")
+                self.soc_last_kql = data["soc"].get("last_kql", "")
+                self.soc_last_records = [r for r in data["soc"].get("last_records", []) if isinstance(r, dict)]
+                self.known_tables = [t for t in data["soc"].get("known_tables", []) if isinstance(t, dict)]
+                self.schema_cache = {k: v for k, v in (data["soc"].get("schema_cache") or {}).items() if isinstance(v, list)}
+                self.soc_suggestions = [s for s in data["soc"].get("suggestions", []) if isinstance(s, dict)]
+                self.soc_next_combo["values"] = [s.get("question", "") for s in self.soc_suggestions]
+                self.soc_next_var.set(self.soc_next_combo["values"][0] if self.soc_suggestions else "")
+                if self.soc_last_records:
+                    self._results_show(self.soc_last_records, self.soc_last_kql)
 
             if "reporter" in data: self.reporter.set_state(data["reporter"])
 
@@ -163,6 +185,7 @@ class SessionTabMixin:
                 self.ioc_results = data["iocs"]
                 self._ioc_populate_tree(source="session")
 
+            self.timeline_refresh()
             self.session_status.config(text=f"Loaded {os.path.basename(f)}", foreground="green")
             messagebox.showinfo("Session Loaded", "Full session state restored.")
         except Exception as e:

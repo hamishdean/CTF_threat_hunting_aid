@@ -5,7 +5,7 @@ import threading
 from ..ai import ai_chat_completion
 from ..deps import filedialog, messagebox, scrolledtext, tk, ttk
 from ..prompts import SYSTEM_PROMPT_INCIDENT_REPORT
-from ..textutil import IOC_PATTERNS, build_timeline, extract_text_from_file
+from ..textutil import IOC_PATTERNS, build_timeline, extract_text_from_file, attack_label
 
 class IncidentTabMixin:
     def _setup_incident_tab(self):
@@ -67,18 +67,25 @@ class IncidentTabMixin:
         sections = []
         source_counts = {"flags": 0, "hints": 0, "bank": False, "soc_queries": 0, "soc_logs": 0, "iocs": 0}
 
-        # 1. Verified Flags & Answers
+        # 1. Verified Flags & Answers (with the query and evidence that produced each)
         if self.ir_src_flags.get() and self.verified_flags_data:
             flags_text = "CONFIRMED FINDINGS / FLAG ANSWERS:\n"
             for f in self.verified_flags_data:
                 flags_text += f"  - {f.get('title', 'Unknown')}"
+                if f.get('flag_answer'):
+                    flags_text += f" | Answer: {f['flag_answer']}"
                 if f.get('note'):
-                    flags_text += f" | Answer: {f['note']}"
+                    flags_text += f" | Note: {f['note']}"
                 if f.get('source'):
                     flags_text += f" | Source: {f['source']}"
                 if f.get('focus_id') and f['focus_id'] != 'General/All':
                     flags_text += f" [{f['focus_id']}]"
                 flags_text += "\n"
+                if f.get('kql'):
+                    flags_text += f"      KQL: {str(f['kql']).strip()[:400]}\n"
+                for row in (f.get('evidence_rows') or [])[:2]:
+                    blob = json.dumps(row, default=str) if isinstance(row, dict) else str(row)
+                    flags_text += f"      Evidence: {blob[:400]}\n"
             sections.append(flags_text)
             source_counts["flags"] = len(self.verified_flags_data)
 
@@ -120,30 +127,38 @@ class IncidentTabMixin:
                 except Exception:
                     pass
 
-        # 5. Extracted Indicators of Compromise (from the IOCs tab).
+        # 5. Extracted Indicators of Compromise (from the IOCs tab), with ATT&CK names
+        #    resolved from the bundled catalogue so the report's mapping is accurate.
         if self.ir_src_iocs.get() and self.ioc_results:
             ioc_lines = ["EXTRACTED INDICATORS OF COMPROMISE (IOCs):"]
             ioc_total = 0
             for category in IOC_PATTERNS:  # stable ordering
                 vals = self.ioc_results.get(category, [])
                 if vals:
-                    ioc_lines.append(f"  {category}: " + ", ".join(vals[:50]))
+                    if category == "mitre":
+                        ioc_lines.append("  mitre: " + "; ".join(attack_label(v) for v in vals[:50]))
+                    else:
+                        ioc_lines.append(f"  {category}: " + ", ".join(vals[:50]))
                     ioc_total += len(vals)
             if ioc_total:
                 sections.append("\n".join(ioc_lines))
                 source_counts["iocs"] = ioc_total
 
         # 6. Deterministic timeline backbone extracted from real timestamps, so the
-        #    AI report is anchored to actual event order rather than a guess.
-        timeline_events = []
-        if self.ir_src_soc.get() and self.soc_last_records:
-            timeline_events.extend(self.soc_last_records)
-        if self.ir_src_flags.get() and self.verified_flags_data:
-            timeline_events.extend(self.verified_flags_data)
-        timeline = build_timeline(timeline_events)
+        #    AI report is anchored to actual event order rather than a guess. Shared
+        #    with the Timeline tab.
+        if hasattr(self, "timeline_events"):
+            saved = self.timeline_include_records.get()
+            self.timeline_include_records.set(bool(self.ir_src_soc.get()))
+            try:
+                timeline = self.timeline_events(max_events=100)
+            finally:
+                self.timeline_include_records.set(saved)
+        else:
+            timeline = build_timeline(list(self.soc_last_records) + list(self.verified_flags_data))
         if timeline:
             tl_text = "DETERMINISTIC TIMELINE (from data timestamps, ascending):\n"
-            tl_text += "\n".join(f"  {ts}  |  {desc}" for ts, desc in timeline)
+            tl_text += "\n".join(f"  {ts}  |  {src}  |  {desc}" for ts, desc, src in timeline)
             sections.append(tl_text)
 
         return "\n\n".join(sections), source_counts
