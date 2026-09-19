@@ -23,4 +23,9 @@ azure-monitor-query>=1.2
 # --- Optional AI providers (install only if you use them) ---
 # The app runs fine without these; the matching provider is simply unavailable.
 anthropic>=0.40          # Claude
-google-generativeai>=0.8 # Gemini
+google-genai>=1.0        # Gemini (the older google-generativeai package is
+                         # deprecated; it still works as a fallback if installed)
+
+# --- Optional quality-of-life ---
+keyring>=24              # remember API keys in the OS keyring between launches
+                         # (Linux also needs a Secret Service backend, e.g. gnome-keyring)
