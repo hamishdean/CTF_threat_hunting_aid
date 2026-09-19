@@ -9,7 +9,7 @@ import threading
 import re
 import datetime
 from datetime import timedelta
-from typing import List, Set
+from typing import List
 
 # --- GUI toolkit (required to run the app, but guarded so the module can still be
 #     imported headlessly for testing / tooling on machines without tkinter) ---
@@ -70,11 +70,11 @@ except ImportError:
 try:
     from azure.identity import DefaultAzureCredential
     from azure.monitor.query import LogsQueryClient
-    from azure.core.exceptions import HttpResponseError
+    from azure.core.exceptions import HttpResponseError, ClientAuthenticationError
     HAS_AZURE = True
 except ImportError:
     HAS_AZURE = False
-    DefaultAzureCredential = LogsQueryClient = HttpResponseError = None
+    DefaultAzureCredential = LogsQueryClient = HttpResponseError = ClientAuthenticationError = None
     _MISSING_LIBS.append("azure-identity + azure-monitor-query")
 
 try:
@@ -96,12 +96,24 @@ try:
 except ImportError:
     pass
 
+# Gemini: prefer the current google-genai SDK. The older google-generativeai
+# package is deprecated and no longer updated, but keep it working as a fallback
+# for machines that still have it installed.
 HAS_GEMINI = False
+GEMINI_SDK = None   # "google-genai" | "legacy" | None
+genai = google_genai = google_genai_types = None
 try:
-    import google.generativeai as genai
+    from google import genai as google_genai
+    from google.genai import types as google_genai_types
     HAS_GEMINI = True
+    GEMINI_SDK = "google-genai"
 except ImportError:
-    pass
+    try:
+        import google.generativeai as genai
+        HAS_GEMINI = True
+        GEMINI_SDK = "legacy"
+    except ImportError:
+        pass
 
 # ==========================================
 # 1. SHARED CONFIGURATION & UTILS
@@ -155,7 +167,7 @@ class SessionLogger:
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(self.text_widget.get("1.0", "end"))
             return True
-        except Exception as e:
+        except Exception:
             return False
 
 class AzureSentinelFormatter:
@@ -200,12 +212,28 @@ def extract_text_from_file(filepath: str) -> List[str]:
         else:
             with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
-                chunk_size = 4000
-                for i in range(0, len(content), chunk_size):
-                    text_chunks.append(content[i:i+chunk_size])
+            text_chunks.extend(chunk_text(content))
     except Exception as e:
         print(f"Error reading {filepath}: {e}")
     return text_chunks
+
+def chunk_text(content, chunk_size=4000):
+    """Split text into ~chunk_size pieces on line boundaries.
+
+    Cutting at a fixed byte offset split log records (one JSONL line from the SOC
+    Agent capture, a syslog line, a CSV row) across two AI batches, so neither
+    batch saw the whole record. A single line longer than chunk_size is emitted
+    on its own rather than truncated."""
+    chunks, buf, size = [], [], 0
+    for line in (content or "").splitlines(keepends=True):
+        if buf and size + len(line) > chunk_size:
+            chunks.append("".join(buf))
+            buf, size = [], 0
+        buf.append(line)
+        size += len(line)
+    if buf:
+        chunks.append("".join(buf))
+    return chunks
 
 # ------------------------------------------
 # IOC EXTRACTION (deterministic - no AI/Azure)
@@ -625,7 +653,47 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
 
     elif provider == "Gemini":
         if not HAS_GEMINI:
-            raise ImportError("google-generativeai package not installed. Run: pip install google-generativeai")
+            raise ImportError("google-genai package not installed. Run: pip install google-genai")
+
+        # Split the system text from the conversation turns (shared by both SDKs).
+        system_text = ""
+        turns = []   # (role, text) with role in {"user", "model"}
+        for msg in messages:
+            if msg["role"] == "system":
+                system_text += msg["content"] + "\n"
+            elif msg["role"] == "assistant":
+                turns.append(("model", msg["content"]))
+            else:
+                turns.append(("user", msg["content"]))
+        if not turns:
+            turns = [("user", "Please proceed.")]
+        system_text = system_text.strip()
+
+        if GEMINI_SDK == "google-genai":
+            client = google_genai.Client(api_key=api_key)
+            cfg = {}
+            if system_text:
+                cfg["system_instruction"] = system_text
+            if json_mode:
+                cfg["response_mime_type"] = "application/json"
+            if temperature is not None:
+                cfg["temperature"] = temperature
+            if max_tokens:
+                cfg["max_output_tokens"] = max_tokens
+            contents = [
+                google_genai_types.Content(role=role, parts=[google_genai_types.Part.from_text(text=text)])
+                for role, text in turns
+            ]
+            response = call_with_retry(lambda: client.models.generate_content(
+                model=model, contents=contents,
+                config=google_genai_types.GenerateContentConfig(**cfg) if cfg else None))
+            # .text is None (with a warning) when the reply had no text part.
+            try:
+                return response.text or ""
+            except Exception:
+                return ""
+
+        # Legacy google-generativeai path.
         genai.configure(api_key=api_key)
         gen_config = {}
         if json_mode:
@@ -634,20 +702,10 @@ def ai_chat_completion(provider, api_key, model, messages, json_mode=False, max_
             gen_config["temperature"] = temperature
         if max_tokens:
             gen_config["max_output_tokens"] = max_tokens
-        # Convert messages to Gemini format
-        system_text = ""
-        contents = []
-        for msg in messages:
-            if msg["role"] == "system":
-                system_text += msg["content"] + "\n"
-            elif msg["role"] == "assistant":
-                contents.append({"role": "model", "parts": [msg["content"]]})
-            else:
-                contents.append({"role": "user", "parts": [msg["content"]]})
-        # Prepend system text to the first user message if present
-        if system_text.strip() and contents:
-            first_content = contents[0]["parts"][0]
-            contents[0]["parts"][0] = system_text.strip() + "\n\n" + first_content
+        contents = [{"role": role, "parts": [text]} for role, text in turns]
+        # The legacy SDK has no system slot here; prepend it to the first user turn.
+        if system_text:
+            contents[0]["parts"][0] = system_text + "\n\n" + contents[0]["parts"][0]
         model_obj = genai.GenerativeModel(model, generation_config=gen_config if gen_config else None)
         response = call_with_retry(lambda: model_obj.generate_content(contents))
         # response.text raises when the model returned no text part (blocked or
@@ -790,7 +848,58 @@ def get_query_context(provider, api_key, user_input, model, history=None, hints=
     except Exception as e:
         return {"table_name": "Error", "kql_query": "", "error": str(e)}
 
-def execute_kql(law_client, workspace_id, kql, hours=8760):
+def build_azure_credential(tenant_id=""):
+    """DefaultAzureCredential tuned for an analyst workstation.
+
+    - Honors an explicit tenant. CTF / client workspaces often live in a tenant
+      where you are a guest, and the default chain otherwise picks your home
+      tenant and fails with a confusing 403/404.
+    - Enables the interactive-browser fallback, so someone without the Azure CLI
+      installed gets a sign-in window instead of a wall of credential errors.
+    The Azure CLI credential still comes first, so `az login` keeps working as
+    before. The tenant also falls back to the AZURE_TENANT_ID environment variable.
+    """
+    if not HAS_AZURE:
+        raise ImportError("Azure libraries not installed. Run: pip install azure-identity azure-monitor-query")
+    kwargs = {"exclude_interactive_browser_credential": False}
+    tenant_id = (tenant_id or os.environ.get("AZURE_TENANT_ID", "")).strip()
+    if tenant_id:
+        kwargs.update({
+            "interactive_browser_tenant_id": tenant_id,
+            "shared_cache_tenant_id": tenant_id,
+            "visual_studio_code_tenant_id": tenant_id,
+        })
+    return DefaultAzureCredential(**kwargs)
+
+def explain_azure_error(exc, workspace_id=""):
+    """Translate the common Azure SDK failures into one actionable sentence.
+
+    Returns "" when the error isn't one we recognise, so callers can fall back
+    to printing the raw exception."""
+    low = str(exc).lower()
+    if (ClientAuthenticationError is not None and isinstance(exc, ClientAuthenticationError)) \
+            or "defaultazurecredential failed" in low or "az login" in low \
+            or "authentication failed" in low or "credential" in low and "unavailable" in low:
+        return ("Azure sign-in failed. Run `az login` (add `--tenant <tenant-id>` if the workspace is in "
+                "a tenant where you are a guest), or set the Tenant ID in Configuration and click "
+                "'Test Azure Connection' to get a browser sign-in window.")
+    if "pathnotfounderror" in low or "not found" in low or "404" in low or "does not exist" in low:
+        return (f"Workspace '{workspace_id}' was not found. Check the Workspace ID (Azure Portal > Log "
+                "Analytics workspace > Overview) and that you are signed in to the tenant that owns it.")
+    if "403" in low or "forbidden" in low or "authorizationfailed" in low or "insufficient" in low:
+        return "Access denied. Your account needs at least the 'Log Analytics Reader' role on the workspace."
+    if "semanticerror" in low or "semantic error" in low or "syntaxerror" in low or "syntax error" in low \
+            or "badargumenterror" in low or "failed to resolve" in low:
+        return "The KQL did not compile (unknown table/column or syntax). Use 'List Tables' to see real table names, then 'Self-Heal Last KQL'."
+    if "timeout" in low or "timed out" in low or "gatewaytimeout" in low:
+        return "The query timed out. Narrow the time range or add a tighter 'where' filter."
+    return ""
+
+def execute_kql(law_client, workspace_id, kql, hours=8760, warn=None):
+    """Run KQL against a workspace and return rows as a list of dicts.
+
+    `warn(msg)` (optional) is called when Azure returns a PARTIAL result, so the
+    analyst knows the row set was truncated instead of silently trusting it."""
     try:
         # Increase limit for manual/custom queries like EXECUTOR.py suggests
         if hours > 8800: hours = 8800
@@ -804,6 +913,9 @@ def execute_kql(law_client, workspace_id, kql, hours=8760):
             tables = response.tables
         elif hasattr(response, 'partial_data'):
             tables = response.partial_data
+            partial_error = getattr(response, "partial_error", None)
+            if warn and partial_error:
+                warn(f"Warning: Azure returned PARTIAL results (row set may be truncated): {partial_error}")
         else:
             tables = []
 
@@ -1194,6 +1306,7 @@ class UnifiedSOCTool:
         # Backwards-compatible alias — returns the active provider's key
         self.api_key_var = self.api_key_vars["OpenAI"]
         self.workspace_id_var = tk.StringVar(value="")
+        self.tenant_id_var = tk.StringVar(value=os.environ.get("AZURE_TENANT_ID", ""))
         self._model_combos = []  # List of (model_var, combo_widget) for provider switching
         self.custom_models = {"OpenAI": [], "Gemini": [], "Claude": []}  # User-added model names
 
@@ -1354,7 +1467,7 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
 
         ttk.Label(keys_frame, text="Gemini API Key:").grid(row=1, column=0, sticky="w", pady=5)
         ttk.Entry(keys_frame, textvariable=self.api_key_vars["Gemini"], width=60, show="*").grid(row=1, column=1, padx=10)
-        ttk.Label(keys_frame, text="(pip install google-generativeai)").grid(row=1, column=2, sticky="w")
+        ttk.Label(keys_frame, text="(pip install google-genai)").grid(row=1, column=2, sticky="w")
 
         ttk.Label(keys_frame, text="Claude API Key:").grid(row=2, column=0, sticky="w", pady=5)
         ttk.Entry(keys_frame, textvariable=self.api_key_vars["Claude"], width=60, show="*").grid(row=2, column=1, padx=10)
@@ -1368,7 +1481,62 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         ttk.Entry(frame, textvariable=self.workspace_id_var, width=60).grid(row=0, column=1, padx=10)
 
         ttk.Label(frame, text="(Required for SOC Agent tab only)").grid(row=0, column=2, sticky="w")
-        ttk.Button(frame, text="Save / Validate", command=lambda: messagebox.showinfo("Info", "Settings ready in memory.")).grid(row=1, column=1, pady=20)
+
+        ttk.Label(frame, text="Azure Tenant ID (optional):").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=self.tenant_id_var, width=60).grid(row=1, column=1, padx=10)
+        ttk.Label(frame, text="(Set if the workspace is in a tenant where you are a guest)").grid(row=1, column=2, sticky="w")
+
+        az_btns = ttk.Frame(frame)
+        az_btns.grid(row=2, column=1, pady=15, sticky="w", padx=10)
+        ttk.Button(az_btns, text="Save / Validate",
+                   command=lambda: messagebox.showinfo("Info", "Settings ready in memory.")).pack(side="left")
+        ttk.Button(az_btns, text="🔌 Test Azure Connection", command=self.test_azure_connection).pack(side="left", padx=10)
+
+        self.azure_status_lbl = ttk.Label(frame, text="Azure: not tested yet", foreground="gray", wraplength=1000, justify="left")
+        self.azure_status_lbl.grid(row=3, column=0, columnspan=3, sticky="w")
+
+    def _get_tenant_id(self):
+        """Return the optional Azure tenant ID, whitespace trimmed."""
+        return self.tenant_id_var.get().strip()
+
+    def _azure_precheck(self, need_api_key=False):
+        """Shared guard for anything that talks to Azure. Returns True when OK."""
+        if not HAS_AZURE:
+            messagebox.showerror(
+                "Missing Library",
+                "This feature needs the Azure libraries, which are not installed.\n\n"
+                "pip install azure-identity azure-monitor-query"
+            )
+            return False
+        if not self._get_workspace_id():
+            messagebox.showerror("Config Error", "Please set the Log Analytics Workspace ID in the Configuration tab.")
+            return False
+        if need_api_key and not self._get_api_key():
+            messagebox.showerror("Config Error", "Please set an API Key in the Configuration tab.")
+            return False
+        return True
+
+    def test_azure_connection(self):
+        """Run a trivial query so the analyst can confirm auth + workspace before hunting."""
+        if not self._azure_precheck():
+            return
+        ws = self._get_workspace_id()
+        self.azure_status_lbl.config(
+            text="Azure: connecting... (if you are not signed in with `az login`, a browser sign-in window will open)",
+            foreground="blue")
+        threading.Thread(target=self._test_azure_thread, args=(ws, self._get_tenant_id()), daemon=True).start()
+
+    def _test_azure_thread(self, ws, tenant_id):
+        try:
+            client = LogsQueryClient(credential=build_azure_credential(tenant_id))
+            rows = execute_kql(client, ws, "print ok=1", hours=1)
+            ok = bool(rows) and str(rows[0].get("ok", "")) == "1"
+            text = (f"Azure: ✅ connected. Workspace {ws} accepted a query." if ok
+                    else "Azure: ⚠️ the workspace answered, but the test query returned nothing.")
+            self.root.after(0, lambda: self.azure_status_lbl.config(text=text, foreground="green" if ok else "#b5651d"))
+        except Exception as e:
+            hint = explain_azure_error(e, ws) or f"{type(e).__name__}: {str(e)[:300]}"
+            self.root.after(0, lambda: self.azure_status_lbl.config(text=f"Azure: ❌ {hint}", foreground="red"))
 
     def _get_provider(self):
         """Return the currently selected AI provider name."""
@@ -1756,7 +1924,12 @@ Recommendations: (What steps should be taken to reduce risk or stop the activity
         self.th_history.pack(fill="both", expand=True)
 
     def th_add_files(self):
-        files = filedialog.askopenfilenames(filetypes=[("All Supported", "*.pdf *.txt *.log *.jsonl"), ("PDF", "*.pdf"), ("Text", "*.txt")])
+        files = filedialog.askopenfilenames(filetypes=[
+            ("All Supported", "*.pdf *.docx *.txt *.log *.jsonl *.json *.csv"),
+            ("PDF", "*.pdf"), ("Word", "*.docx"),
+            ("Text / Logs", "*.txt *.log *.jsonl *.json *.csv"),
+            ("All Files", "*.*"),
+        ])
         for f in files:
             if f not in self.th_files:
                 self.th_files.append(f)
@@ -2096,9 +2269,10 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         top_ctrl = ttk.Frame(ctrl_frame)
         top_ctrl.pack(fill="x", pady=2)
         ttk.Label(top_ctrl, text="Instruction / Query:").pack(side="left")
-        ttk.Label(top_ctrl, text="Model:").pack(side="right")
+        # Pack the combobox first so it sits at the far right with its label to its left.
         soc_model_combo = ttk.Combobox(top_ctrl, textvariable=self.soc_model_var, values=self._get_models_for_provider(), state="readonly", width=25)
         soc_model_combo.pack(side="right")
+        ttk.Label(top_ctrl, text="Model:").pack(side="right")
         self._model_combos.append((self.soc_model_var, soc_model_combo))
 
         self.soc_prompt_text = tk.Text(ctrl_frame, height=3, font=("Consolas", 10), wrap="word")
@@ -2112,22 +2286,45 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         self.soc_stop_btn.pack(side="left", padx=2)
         ttk.Button(btn_box, text="Generate KQL Only", command=self.soc_gen_kql).pack(side="left", padx=2)
         ttk.Button(btn_box, text="Open Manual KQL Editor", command=self.soc_open_manual_kql).pack(side="left", padx=2)
+        ttk.Button(btn_box, text="📋 List Tables", command=self.soc_list_tables).pack(side="left", padx=2)
         ttk.Button(btn_box, text="💾 Export Log to File", command=self.soc_export_log).pack(side="right", padx=2)
         ttk.Button(btn_box, text="🩹 Self-Heal Last KQL", command=self.soc_self_heal).pack(side="right", padx=2)
         ttk.Button(btn_box, text="🧹 Clear Console", command=self.soc_clear_console).pack(side="right", padx=2)
 
     def _soc_precheck(self):
-        if not HAS_AZURE:
-            messagebox.showerror(
-                "Missing Library",
-                "The SOC Agent needs the Azure libraries, which are not installed.\n\n"
-                "pip install azure-identity azure-monitor-query"
-            )
-            return False
-        if not self._get_api_key() or not self._get_workspace_id():
-            messagebox.showerror("Config Error", "Please set API Key and Workspace ID in Configuration Tab.")
-            return False
-        return True
+        # Every SOC Agent path that runs a query also hands the rows to the AI,
+        # so it needs both Azure config and an API key.
+        return self._azure_precheck(need_api_key=True)
+
+    def soc_list_tables(self):
+        """Show which tables actually hold data, so hunts (and the AI) target real tables."""
+        if not self._azure_precheck():
+            return
+        threading.Thread(target=self._soc_list_tables_thread,
+                         args=(self._get_workspace_id(), self._get_tenant_id()), daemon=True).start()
+
+    def _soc_list_tables_thread(self, ws, tenant_id):
+        kql = ("union withsource=TableName * "
+               "| summarize Rows=count(), Latest=max(TimeGenerated) by TableName "
+               "| sort by Rows desc")
+        self.soc_print(f"{Fore.CYAN}--- TABLES WITH DATA (last 365 days) ---{Fore.RESET}")
+        try:
+            client = LogsQueryClient(credential=build_azure_credential(tenant_id))
+            rows = execute_kql(client, ws, kql, hours=8760, warn=self.soc_print)
+            if not rows:
+                self.soc_print("No tables contain data in the last 365 days.")
+                return
+            self.soc_print(f"{'TableName':<42}{'Rows':>10}   Latest record")
+            for r in rows:
+                self.soc_print(f"{str(r.get('TableName', '')):<42}{str(r.get('Rows', '')):>10}   {r.get('Latest', '')}")
+            self.soc_print(f"{len(rows)} table(s). Tip: name one of these in your prompt to steer the AI's KQL.")
+        except Exception as e:
+            self.last_kql = kql
+            self.last_error = str(e)
+            self.soc_print(f"{Fore.RED}Could not list tables: {e}{Fore.RESET}")
+            hint = explain_azure_error(e, ws)
+            if hint:
+                self.soc_print(f"{Fore.YELLOW}Hint: {hint}{Fore.RESET}")
 
     def _set_ai_running(self, running):
         """Toggle AI running state and update button availability."""
@@ -2287,7 +2484,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         try:
             provider = self._get_provider()
             api_key = self._get_api_key()
-            law_client = LogsQueryClient(credential=DefaultAzureCredential())
+            law_client = LogsQueryClient(credential=build_azure_credential(self._get_tenant_id()))
             model = self.soc_model_var.get()
 
             # Use active hints
@@ -2334,7 +2531,7 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
             # Default to 1 year (8760h) for AI queries
             time_range = ctx.get('time_range_hours', 8760)
 
-            results = execute_kql(law_client, self._get_workspace_id(), kql, time_range)
+            results = execute_kql(law_client, self._get_workspace_id(), kql, time_range, warn=self.soc_print)
 
             if self._ai_cancelled():
                 self.soc_print(f"{Fore.YELLOW}--- AI INVESTIGATION STOPPED ---{Fore.RESET}")
@@ -2351,6 +2548,9 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         except Exception as e:
             self.last_error = str(e)
             self.soc_print(f"{Fore.RED}Error: {e}{Fore.RESET}")
+            hint = explain_azure_error(e, self._get_workspace_id())
+            if hint:
+                self.soc_print(f"{Fore.YELLOW}Hint: {hint}{Fore.RESET}")
         finally:
             self._set_ai_running(False)
 
@@ -2415,9 +2615,10 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
     def _soc_manual_thread(self, kql):
         self.soc_print(f"Running Manual KQL: {kql}")
         self.last_kql = kql
+        self.last_error = ""   # don't let a stale error from an earlier query leak into Self-Heal
         try:
-            law_client = LogsQueryClient(credential=DefaultAzureCredential())
-            results = execute_kql(law_client, self._get_workspace_id(), kql, hours=8760)
+            law_client = LogsQueryClient(credential=build_azure_credential(self._get_tenant_id()))
+            results = execute_kql(law_client, self._get_workspace_id(), kql, hours=8760, warn=self.soc_print)
             self.soc_last_records = results
 
             if self._ai_cancelled():
@@ -2446,6 +2647,9 @@ Example: "The flag is flag{{abc123}}" or "The malicious IP is 192.168.1.5"
         except Exception as e:
             self.last_error = str(e)
             self.soc_print(f"{Fore.RED}Query Failed: {e}{Fore.RESET}")
+            hint = explain_azure_error(e, self._get_workspace_id())
+            if hint:
+                self.soc_print(f"{Fore.YELLOW}Hint: {hint}{Fore.RESET}")
         finally:
             self._set_ai_running(False)
 
@@ -3175,13 +3379,15 @@ PREREQUISITES
       pip install colorama python-docx
   - Optional AI providers (install as needed):
       pip install anthropic          (for Claude support)
-      pip install google-generativeai (for Gemini support)
+      pip install google-genai        (for Gemini support)
   - An API key for your chosen AI provider:
       OpenAI: https://platform.openai.com
       Google Gemini: https://aistudio.google.com
       Anthropic Claude: https://console.anthropic.com
   - An Azure Log Analytics Workspace ID (for the SOC Agent tab)
-  - Azure credentials configured (az login, or environment variables)
+  - Azure credentials: run "az login" (Azure CLI), or just click
+    "Test Azure Connection" in Configuration and sign in via the browser
+    window that opens.
 
 FIRST LAUNCH
   1. Run the tool:  python unifiedsoctool.py
@@ -3189,7 +3395,9 @@ FIRST LAUNCH
   3. Select your AI Provider (OpenAI, Gemini, or Claude).
   4. Paste the corresponding API key.
   5. Paste your Log Analytics Workspace ID (for SOC Agent tab).
-  6. Click "Save / Validate".
+     If the workspace lives in a tenant where you are a guest (typical for
+     CTFs and client engagements), also paste that Tenant ID.
+  6. Click "Test Azure Connection" - it should turn green.
   7. You are now ready to use all features.
 
 
@@ -3206,7 +3414,9 @@ FIRST LAUNCH
   - Select your AI Provider (OpenAI, Gemini, or Claude).
   - Paste your API key(s) in the corresponding field(s) (masked for security).
   - Paste your Azure Log Analytics Workspace ID in the Azure Settings section.
-  - Click "Save / Validate" to confirm settings are loaded.
+  - Optional: paste the Azure Tenant ID that owns the workspace.
+  - Click "Test Azure Connection". Green = signed in and the workspace answered.
+    Red = a one-line explanation of what to fix (sign-in, wrong ID, missing role).
   - These credentials are NOT saved to disk unless you use Session Manager.
   - Tip: API keys can be set via environment variables:
     OPENAI_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY
@@ -3279,6 +3489,8 @@ FIRST LAUNCH
   OTHER BUTTONS:
   - "Generate KQL Only": See the AI-generated query without running it.
   - "Open Manual KQL Editor": Write and execute your own KQL query directly.
+  - "List Tables": Show every table that has data in the last year, with row
+    counts. Name one of them in your prompt to steer the AI's KQL.
   - "Export Log to File": Save the console output to a .txt file.
   - "Self-Heal Last KQL": If a query fails, the AI attempts to fix and
     re-run it automatically.
@@ -3473,8 +3685,12 @@ FIRST LAUNCH
     fix the syntax error.
   - "API key error": Make sure your API key is valid and has credits.
     Ensure the correct provider is selected in the Configuration tab.
-  - "Azure auth error": Run "az login" in your terminal first, or set
-    Azure credential environment variables.
+  - "Azure sign-in failed": Run "az login" (add --tenant <id> for a guest
+    tenant), or set the Tenant ID in Configuration and click "Test Azure
+    Connection" to sign in through the browser.
+  - "Workspace not found": Re-check the Workspace ID and that you are signed
+    in to the tenant that owns it.
+  - "Access denied": You need the Log Analytics Reader role on the workspace.
   - "Missing library": Run the pip install command shown at startup.
 
   KEYBOARD & MOUSE:
@@ -3498,6 +3714,7 @@ FIRST LAUNCH
                 "api_key_gemini": self.api_key_vars["Gemini"].get() if include_keys else "",
                 "api_key_claude": self.api_key_vars["Claude"].get() if include_keys else "",
                 "workspace_id": self.workspace_id_var.get(),
+                "tenant_id": self.tenant_id_var.get(),
                 "custom_models": self.custom_models,
                 "active_flag": self.active_flag_var.get()
             },
@@ -3562,6 +3779,8 @@ FIRST LAUNCH
                     # Legacy format: single OpenAI key
                     self.api_key_vars["OpenAI"].set(cfg.get("api_key", ""))
                 self.workspace_id_var.set(cfg.get("workspace_id", ""))
+                if cfg.get("tenant_id"):
+                    self.tenant_id_var.set(cfg["tenant_id"])
                 self.active_flag_var.set(cfg.get("active_flag", "General/All"))
                 # Restore custom models before triggering provider change
                 saved_custom = cfg.get("custom_models", {})
